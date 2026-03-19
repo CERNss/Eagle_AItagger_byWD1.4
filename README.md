@@ -33,7 +33,7 @@ The previous Windows batch workflow has been removed on purpose. This repository
 ├─ scripts/
 │  └─ smoke_test.py        # Basic service smoke test
 ├─ Dockerfile
-├─ compose.yaml
+├─ docker-compose.yaml
 ├─ requirements.txt
 └─ csv/Tags-cn_2024_ver-1.0.csv
 ```
@@ -59,6 +59,40 @@ The service is configured entirely through environment variables.
 | `ADDITIONAL_TAGS` | empty | Comma-separated tags always appended with score `1.0` |
 | `EXCLUDE_TAGS` | empty | Comma-separated tags always filtered out |
 | `SORT_ALPHABETICALLY` | `false` | Sort alphabetically instead of by score desc |
+
+### Observability
+
+The service writes structured JSON logs to stdout using Loguru. Fluent Bit or any other collector can scrape the container logs without additional file mounts. OpenTelemetry tracing and metrics are disabled by default but can be turned on per deployment via environment variables.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `LOG_LEVEL` | `INFO` | Loguru log level |
+| `LOG_FORMAT` | `json` | `json` (structured) or `text` |
+| `LOG_INCLUDE_TRACE` | `true` | Include OTEL trace/span ids in logs when available |
+| `LOG_HASH_IMAGE_PATHS` | `true` | Hash filesystem paths instead of logging raw values |
+| `SERVICE_NAME` | `eagle-ai-tagger` | OTEL resource `service.name` |
+| `SERVICE_VERSION` | `dev` | OTEL resource `service.version` |
+| `DEPLOYMENT_ENVIRONMENT` | `development` | OTEL `deployment.environment` |
+| `OTEL_ENABLED` | `false` | Enable OTEL tracing |
+| `OTEL_EXPORTER_ENDPOINT` | unset | OTLP/HTTP endpoint (e.g. `http://otel-collector:4318`) |
+| `OTEL_EXPORTER_HEADERS` | unset | Comma-separated `key=value` headers for OTLP |
+| `OTEL_TRACE_SAMPLE_RATIO` | `0.1` | Trace sampling ratio (0–1) |
+| `OTEL_METRICS_ENABLED` | `false` | Enable OTEL metrics |
+| `OTEL_METRICS_EXPORTER_ENDPOINT` | uses `OTEL_EXPORTER_ENDPOINT` | Override metrics endpoint |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `60` | Metric push interval in seconds |
+
+Example Compose snippet wiring tracing/metrics to a collector named `otel-collector`:
+
+```yaml
+environment:
+  LOG_LEVEL: INFO
+  OTEL_ENABLED: "true"
+  OTEL_METRICS_ENABLED: "true"
+  OTEL_EXPORTER_ENDPOINT: http://otel-collector:4318
+  OTEL_TRACE_SAMPLE_RATIO: "0.2"
+```
+
+When tracing/metrics remain disabled (the defaults), only structured stdout logs are produced, so Fluent Bit can still ship them without additional configuration.
 
 ## Local Run
 
@@ -113,7 +147,7 @@ docker run --rm --gpus all nvidia/cuda:12.9.0-base-ubuntu22.04 nvidia-smi
 
 ### `GET /healthz`
 
-Returns process health, provider information, and model/tag paths.
+Returns process health, provider information, model/tag paths, and observability status (logging mode plus tracing/metrics booleans). The observability fields let you confirm whether OTEL exporters are active without shelling into the container.
 
 Example:
 
@@ -123,7 +157,7 @@ curl http://127.0.0.1:8000/healthz
 
 ### `GET /readyz`
 
-Returns `200` only after the model runtime has loaded successfully.
+Returns `200` only after the model runtime has loaded successfully. The response mirrors the observability flags so readiness probes can assert tracing/metrics state as part of deployment checks.
 
 Example:
 
