@@ -10,9 +10,13 @@ __pycache__/
 *.onnx
 model/
 
-# IDE
+# IDE / AI agent tooling
 .vscode/
 .idea/
+.agents/
+.claude/
+.codex/
+.opencode/
 
 # OS
 .DS_Store
