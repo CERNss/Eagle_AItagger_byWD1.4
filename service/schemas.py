@@ -35,6 +35,7 @@ class BatchTagItem(BaseModel):
     tags: list[TagRecord] = Field(default_factory=list)
     elapsed_ms: int | None = None
     error: str | None = None
+    error_type: str | None = None
 
 
 class BatchTagResponse(BaseModel):
@@ -48,8 +49,14 @@ class HealthResponse(BaseModel):
     provider: str
     model_path: str
     tags_path: str
+    logging_mode: str
+    tracing_enabled: bool
+    metrics_enabled: bool
 
 
 class ReadyResponse(BaseModel):
     status: str
     provider: str
+    logging_mode: str
+    tracing_enabled: bool
+    metrics_enabled: bool

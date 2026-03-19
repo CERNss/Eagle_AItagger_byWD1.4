@@ -8,9 +8,17 @@ from typing import Any
 import onnxruntime as ort
 from PIL import Image
 import pandas as pd
+from loguru import logger
 
 from .image_utils import ImageUtils
+from .logging import reset_image_path_context, set_image_path_context
+from .observability import metrics_recorder
 from .settings import Settings
+
+try:
+    import pynvml
+except ImportError:  # pragma: no cover - optional dependency
+    pynvml = None
 
 
 class TaggerRuntime:
@@ -28,6 +36,8 @@ class TaggerRuntime:
         self.has_chinese_names = False
         self.english_names: list[str] = []
         self.chinese_names: list[str] = []
+        self._nvml_initialized = False
+        self._nvml_handle = None
 
     def load(self) -> None:
         self.settings.validate()
@@ -48,6 +58,14 @@ class TaggerRuntime:
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
         self.target_size = self._resolve_target_size(self.session.get_inputs()[0].shape)
+        logger.info(
+            "runtime.loaded",
+            provider=self.provider,
+            model=self.settings.model_path.name,
+            tags_csv=self.settings.tags_path.name,
+        )
+        if "CUDA" in self.provider.upper():
+            self._init_nvml()
 
         tags_df = pd.read_csv(self.settings.tags_path)
         if "name" not in tags_df.columns:
@@ -99,23 +117,34 @@ class TaggerRuntime:
             raise RuntimeError("runtime is not loaded")
 
         resolved_path = self.resolve_image_path(image_path)
+        image_ctx = set_image_path_context(resolved_path)
         started = time.perf_counter()
-        with Image.open(resolved_path) as image:
-            processed = ImageUtils.preprocess_image(image, self.target_size)
-        scores = self.session.run([self.output_name], {self.input_name: processed})[0][0]
+        try:
+            with Image.open(resolved_path) as image:
+                processed = ImageUtils.preprocess_image(image, self.target_size)
+            scores = self.session.run([self.output_name], {self.input_name: processed})[0][0]
 
-        tags = self._postprocess_scores(
-            scores=scores,
-            threshold=self.settings.default_threshold if threshold is None else threshold,
-            use_chinese_name=(
-                self.settings.default_use_chinese_name
-                if use_chinese_name is None
-                else use_chinese_name
-            ),
-            top_k=self.settings.default_top_k if top_k is None else top_k,
-        )
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        return resolved_path, tags, elapsed_ms
+            tags = self._postprocess_scores(
+                scores=scores,
+                threshold=self.settings.default_threshold if threshold is None else threshold,
+                use_chinese_name=(
+                    self.settings.default_use_chinese_name
+                    if use_chinese_name is None
+                    else use_chinese_name
+                ),
+                top_k=self.settings.default_top_k if top_k is None else top_k,
+            )
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            self._record_gpu_metrics()
+            logger.info(
+                "runtime.predict.complete",
+                provider=self.provider,
+                elapsed_ms=elapsed_ms,
+                tag_count=len(tags),
+            )
+            return resolved_path, tags, elapsed_ms
+        finally:
+            reset_image_path_context(image_ctx)
 
     def predict_batch(
         self,
@@ -155,8 +184,21 @@ class TaggerRuntime:
                         "tags": [],
                         "elapsed_ms": None,
                         "error": str(exc),
+                        "error_type": exc.__class__.__name__,
                     }
                 )
+                logger.warning(
+                    "runtime.predict.failed",
+                    error=str(exc),
+                    error_type=exc.__class__.__name__,
+                )
+        failure_count = sum(1 for item in results if not item["success"])
+        logger.info(
+            "runtime.predict_batch.complete",
+            total=len(image_paths),
+            failures=failure_count,
+            provider=self.provider,
+        )
         return results
 
     def _postprocess_scores(
@@ -217,3 +259,42 @@ class TaggerRuntime:
             {"name": tag, "score": round(score, 6)}
             for tag, score in normalized[:top_k]
         ]
+
+    def _init_nvml(self) -> None:
+        if pynvml is None or self._nvml_initialized:
+            return
+        try:
+            pynvml.nvmlInit()
+            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            self._nvml_initialized = True
+        except Exception as exc:  # pragma: no cover - NVML optional
+            logger.warning("nvml.init.failed", error=str(exc))
+
+    def _read_gpu_memory(self) -> int | None:
+        if pynvml is None or not self._nvml_initialized or self._nvml_handle is None:
+            return None
+        try:
+            info = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+            return int(info.used)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("nvml.read.failed", error=str(exc))
+            return None
+
+    def _record_gpu_metrics(self) -> None:
+        if "CUDA" not in self.provider.upper():
+            return
+        memory_bytes = self._read_gpu_memory()
+        if memory_bytes is None:
+            return
+        metrics_recorder().record_gpu(self.provider, memory_bytes)
+
+    def shutdown(self) -> None:
+        if self._nvml_initialized and pynvml is not None:
+            try:
+                pynvml.nvmlShutdown()
+                logger.info("nvml.shutdown.ok")
+            except Exception as exc:
+                logger.warning("nvml.shutdown.failed", error=str(exc))
+            finally:
+                self._nvml_initialized = False
+                self._nvml_handle = None
