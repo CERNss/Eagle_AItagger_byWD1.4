@@ -1,6 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Models (large binary files)
 *.onnx
-/.venv
-/__pycache__
-/.vscode
-/mian/__pycache__
-*.pyc
+model/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Docker
+*.env
+
+# Logs
+*.log
+run.log
