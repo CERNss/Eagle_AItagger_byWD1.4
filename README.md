@@ -1,225 +1,203 @@
-## Eagle AI 图像标注工具
+# Eagle AI Tagger Service
 
-基于 WD14 模型的 Eagle 图像自动标注工具，支持多进程 GPU 加速推理和中文标签。
+Linux-only WD14 image tagging microservice for Eagle-style libraries. The service loads a WD14 ONNX model once, serves inference over HTTP, and is designed to run in Docker with NVIDIA GPU access.
 
-### 版本 4.0.0 更新说明
+## What This Repository Is Now
 
-- ✅ 字典已完成全部汉化
+- Long-lived FastAPI service
+- ONNX Runtime GPU inference with CUDA-first provider selection
+- Filesystem-path based `/tag` and `/tag/batch` APIs
+- Docker Compose deployment for Linux + NVIDIA
 
-- ✅ 支持多进程推理，自动管理推理任务
+The previous Windows batch workflow has been removed on purpose. This repository now treats Linux service deployment as the primary and only supported runtime shape.
 
-- ✅ 实时进度监控
+## Requirements
 
-#### 4.0.0 版本前生成的英文标签更新方式
+- Linux host
+- NVIDIA GPU with working `nvidia-smi`
+- Docker Engine with NVIDIA Container Toolkit installed
+- WD14 ONNX model file, for example `swinv2-v3.onnx`
+- Tag CSV file: `Tags-cn_2024_ver-1.0.csv`
 
-如需将之前版本生成的英文标签更新为中文标签，请使用 `uptags.py` 工具。
+## Repository Layout
 
-注意：默认旧代码 `_` 被转义为了 ` `，如果旧代码是下划线版本，注释151行 `df['name'] = df['name'].str.replace('_', ' ')`
+```text
+.
+├─ main.py                 # Local Uvicorn runner
+├─ service/
+│  ├─ app.py               # FastAPI app and endpoints
+│  ├─ runtime.py           # ONNX runtime and tag post-processing
+│  ├─ schemas.py           # Request/response models
+│  ├─ settings.py          # Environment-driven configuration
+│  └─ image_utils.py       # WD14 image preprocessing
+├─ scripts/
+│  └─ smoke_test.py        # Basic service smoke test
+├─ Dockerfile
+├─ compose.yaml
+├─ requirements.txt
+└─ csv/Tags-cn_2024_ver-1.0.csv
+```
 
-## 环境需求
+## Configuration
 
-- **GPU**: NVIDIA GPU (推荐 4GB+ 显存)
+The service is configured entirely through environment variables.
 
-- **Python**: 3.8+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `HOST` | `0.0.0.0` | Bind address for local `python main.py` runs |
+| `PORT` | `8000` | HTTP port |
+| `MODEL_PATH` | `model/swinv2-v3.onnx` | ONNX model path |
+| `TAGS_PATH` | `csv/Tags-cn_2024_ver-1.0.csv` | Tag CSV path |
+| `IMAGE_ROOT` | unset | Optional root directory restriction for image paths |
+| `DEFAULT_THRESHOLD` | `0.5` | Default score threshold |
+| `USE_CHINESE_NAME` | `true` | Use `right_tag_cn` when available |
+| `DEFAULT_TOP_K` | `50` | Default max returned tag count |
+| `BATCH_LIMIT` | `64` | Maximum paths per `/tag/batch` request |
+| `REPLACE_UNDERSCORE` | `true` | Replace `_` with spaces in returned tags |
+| `UNDERSCORE_EXCLUDES` | empty | Comma-separated tags that keep underscores |
+| `ESCAPE_TAGS` | `false` | Escape `\`, `(`, `)` in returned tags |
+| `ADDITIONAL_TAGS` | empty | Comma-separated tags always appended with score `1.0` |
+| `EXCLUDE_TAGS` | empty | Comma-separated tags always filtered out |
+| `SORT_ALPHABETICALLY` | `false` | Sort alphabetically instead of by score desc |
 
-- **CUDA**: 12.9 ([下载地址](https://developer.download.nvidia.com/compute/cuda/12.9.0/local_installers/cuda_12.9.0_576.02_windows.exe))
+## Local Run
 
-- **cuDNN**: 9.10.1 ([下载地址](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.10.1.4_cuda12-archive.zip))
-
-- **VC_redist.x64**: ([下载地址](https://aka.ms/vs/17/release/vc_redist.x64.exe))
-
-### GPU 推理配置
-
-1. 安装 CUDA 12.9
-
-2. 安装 cuDNN 9.10.1（将解压文件夹内容复制到 CUDA 安装目录，通常是 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9`）
-
-3. 安装 VC_redist.x64
-
-4. [安装教程视频](https://www.bilibili.com/video/BV116eBefETi/)
-
-## 快速开始
-
-### 1. 安装依赖
+1. Install dependencies:
 
 ```bash
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
-### 2. 下载模型
+2. Put your model file in `./model`, for example:
 
-从支持的模型列表中选择模型，下载到 `./model` 目录并重命名为对应的模型名称：
-    
-    - 示例：./model/swinv2-v3
-
-**支持的模型列表：**
-
-- **推荐模型**:
-  
-  - [swinv2-v3](https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/tree/main) - 大多数情况推荐
-  
-  - [eva02-large-v3](https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/tree/main) - 精度更高，但资源消耗更大
-
-- **其他模型**:
-  
-  - [convnext-v3](https://huggingface.co/SmilingWolf/wd-convnext-tagger-v3/tree/main)
-  
-  - [convnextv2-v2](https://huggingface.co/SmilingWolf/wd-v1-4-convnextv2-tagger-v2/tree/main)
- 
-  - [vit-large-v3](https://huggingface.co/SmilingWolf/wd-vit-large-tagger-v3/tree/main)
-  
-  - [更多模型...](#支持的模型列表)
-
-**镜像站**: https://hf-mirror.com/SmilingWolf/
-
-### 3. 准备图片列表
-
-从 Eagle 选择需要标注的图片，右键选择 **复制文件路径** (快捷键 `Ctrl+Alt+C`)，将路径粘贴到 `image_list.txt`：
-
-```
-E:\动画与设计资源库.library\images\MAQGISQ1ELX97.info\124956717_p0.png
-E:\动画与设计资源库.library\images\MAQGISQ1N6OHU.info\124719914_p0.png
-E:\动画与设计资源库.library\images\MAQGISQ1Z8PST.info\124086849_p0.png
+```bash
+mkdir -p model
+cp /path/to/swinv2-v3.onnx model/swinv2-v3.onnx
 ```
 
-### 4. 配置参数
+3. Start the service:
 
-编辑 `config.ini` 文件：
-
-```ini
-[Model]
-model_path = ./model/swinv2-v3.onnx  ; 模型文件路径
-tags_path = ./csv/Tags-cn_2024_ver-1.0.csv  ; 标签字典路径
-
-[Tag]
-threshold = 0.5  ; 置信度阈值
-use_chinese_name = True  ; 使用中文标签
+```bash
+python3 main.py
 ```
 
-### 5. 运行程序
+4. Optional smoke test:
 
-运行 `run.bat`
+```bash
+python3 scripts/smoke_test.py
+python3 scripts/smoke_test.py --image-path /absolute/path/to/image.png
+```
 
-或运行 `main.py`
+## Docker Run
 
-## 配置文件详解
+The provided Compose file expects:
 
-### [Version] - 版本信息
+- model file at `./model/swinv2-v3.onnx`
+- tag CSV at `./csv/Tags-cn_2024_ver-1.0.csv`
+- images shared from `/srv/shared-images` on the host
 
-**请勿修改此部分**
+Start the service:
 
-- `version`: 版本号
+```bash
+docker compose up --build
+```
 
-- `update_notes`: 版本更新说明
+Before doing that, verify the host first:
 
-### [Model] - 模型配置
+```bash
+nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.9.0-base-ubuntu22.04 nvidia-smi
+```
 
-- `model_path`: 推理模型路径（相对路径）
+## API
 
-- `tags_path`: 标签字典路径（相对路径）
+### `GET /healthz`
 
-### [Tag] - 标签处理
+Returns process health, provider information, and model/tag paths.
 
-- `threshold`: **置信度阈值** (范围 0-1，默认 0.5)
+Example:
 
-- `replace_underscore`: 是否将下划线替换为空格（4.1版本计划删除）
+```bash
+curl http://127.0.0.1:8000/healthz
+```
 
-- `underscore_excludes`: 不替换下划线的标签列表（4.1版本计划删除）
+### `GET /readyz`
 
-- `escape_tags`: 是否转义特殊字符（4.1版本计划删除）
+Returns `200` only after the model runtime has loaded successfully.
 
-- `use_chinese_name`: **是否使用中文标签名称**
+Example:
 
-- `additional_tags`: 强制添加的标签（逗号分隔）
+```bash
+curl http://127.0.0.1:8000/readyz
+```
 
-- `exclude_tags`: 强制排除的标签（逗号分隔）
+### `POST /tag`
 
-- `sort_alphabetically`: 是否按字母顺序排序（默认按置信度降序）
+Tags a single image path.
 
-### [Json] - JSON 输出配置
+Request:
 
-- `is_creat_image_info_csv`: 是否创建 image_info.csv（4.1版本计划删除）
+```json
+{
+  "image_path": "/data/images/example.png",
+  "threshold": 0.5,
+  "use_chinese_name": true,
+  "top_k": 50
+}
+```
 
-- `add_write_mode`: 标签写入模式 - `True`: 追加写入, `False`: 覆盖写入
+Example:
 
-### [Process] - 进程配置
+```bash
+curl -X POST http://127.0.0.1:8000/tag \
+  -H 'Content-Type: application/json' \
+  -d '{"image_path":"/data/images/example.png","threshold":0.5,"use_chinese_name":true,"top_k":50}'
+```
 
-- `max_workers`: **工作进程数**（根据 GPU 显存调整）
+### `POST /tag/batch`
 
-  - Eva02 模型 (1.5GB): 6G显存:2进程, 8G显存:3进程（推荐保留2G空闲显存）
+Tags multiple image paths in one request. Invalid items are returned as item-level errors instead of aborting the whole batch.
 
-- `batch_size`: 批处理大小（自动调整，无需手动设置）
+Request:
 
-- `max_retries`: 失败重试次数
+```json
+{
+  "image_paths": [
+    "/data/images/example-1.png",
+    "/data/images/example-2.png"
+  ],
+  "threshold": 0.5,
+  "use_chinese_name": true,
+  "top_k": 50
+}
+```
 
-- `checkpoint_interval`: 检查点间隔
+## Operational Notes
 
-## 支持的模型列表
+- The first version is intentionally single-process and single-session. Do not start Uvicorn with multiple workers unless you are ready for multiple model copies in memory.
+- The service does not mutate Eagle `metadata.json` files. It only returns inference results.
+- If `IMAGE_ROOT` is set, every requested image path must resolve inside that directory.
+- If `/healthz` reports `CPUExecutionProvider`, your container GPU runtime is not wired correctly.
 
-**仅支持wd类的模型，db类的不支持**
+## Recommended Integration Pattern
 
-[convnext-v3](https://huggingface.co/SmilingWolf/wd-convnext-tagger-v3/tree/main) | [convnextv2-v2](https://huggingface.co/SmilingWolf/wd-v1-4-convnextv2-tagger-v2/tree/main) | [convnext-v2](https://huggingface.co/SmilingWolf/wd-v1-4-convnext-tagger-v2/tree/main) | [convnext](https://huggingface.co/SmilingWolf/wd-v1-4-convnext-tagger/tree/main)
+Mount the same image directory into both your business service and this tagger service, then send shared filesystem paths over HTTP.
 
-[swinv2-v2](https://huggingface.co/SmilingWolf/wd-v1-4-swinv2-tagger-v2/tree/main) | [swinv2-v3](https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/tree/main)
+Example Python client:
 
-[vit-large-v3](https://huggingface.co/SmilingWolf/wd-vit-large-tagger-v3/tree/main) | [vit-v3](https://huggingface.co/SmilingWolf/wd-vit-tagger-v3/tree/main) | [vit-v2](https://huggingface.co/SmilingWolf/wd-v1-4-vit-tagger-v2/tree/main) | [vit](https://huggingface.co/SmilingWolf/wd-v1-4-vit-tagger/tree/main)
+```python
+import requests
 
-[moat-v2](https://huggingface.co/SmilingWolf/wd-v1-4-moat-tagger-v2/tree/main)
-
-[eva02-large-v3](https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/tree/main)
-
-镜像站：https://hf-mirror.com/SmilingWolf/
-
-## 故障排除
-
-### 常见问题
-
-**1. 模型加载失败**
-
-- 检查模型文件路径是否正确
-
-- 确认模型文件完整无损
-
-- 验证 CUDA 和 cuDNN 安装
-
-**2. GPU 内存不足**
-
-- 减少 `max_workers` 数量
-
-- 关闭其他占用 GPU 的程序
-
-- 使用较小模型（如 swinv2-v3）
-
-**3. 图片处理失败**
-
-- 检查图片路径是否正确
-
-- 确认图片文件没有损坏
-
-- 验证图片格式支持
-
-**4. 标签生成异常**
-
-- 检查标签字典文件
-
-- 调整置信度阈值
-
-- 验证配置参数
-
-## tag数据集
-
-部分汉化：[NGA阿巧](https://ngabbs.com/read.php?tid=33869519)
-
-    ./csv/人名tag.xlsx
-
-    ./csv/中文化danbooru-tag对照表-词性对AI用优化版-Editor阿巧.xlsx
-
-阿巧未汉化的5630条：在 4.0.0 已经全部汉化完成。
-
-原始数据集：Danbooru2024
-
-    ./csv/selected_tags.csv
-
-## 引用
-
-代码核心模块前身： [秋叶lora训练器](https://github.com/Akegarasu/lora-scripts)
+response = requests.post(
+    "http://tagger:8000/tag",
+    json={
+        "image_path": "/data/images/example.png",
+        "threshold": 0.5,
+        "use_chinese_name": True,
+        "top_k": 50,
+    },
+    timeout=30,
+)
+response.raise_for_status()
+print(response.json())
+```

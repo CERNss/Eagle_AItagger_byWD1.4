@@ -1,0 +1,37 @@
+services:
+  tagger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eagle-ai-tagger:latest
+    container_name: eagle-ai-tagger
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: /models/swinv2-v3.onnx
+      TAGS_PATH: /models/Tags-cn_2024_ver-1.0.csv
+      IMAGE_ROOT: /data/images
+      DEFAULT_THRESHOLD: "0.5"
+      USE_CHINESE_NAME: "true"
+      DEFAULT_TOP_K: "50"
+      BATCH_LIMIT: "64"
+      NVIDIA_VISIBLE_DEVICES: "all"
+    volumes:
+      - ./model:/models:ro
+      - ./csv/Tags-cn_2024_ver-1.0.csv:/models/Tags-cn_2024_ver-1.0.csv:ro
+      - /srv/shared-images:/data/images:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
