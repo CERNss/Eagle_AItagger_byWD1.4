@@ -4,6 +4,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+import warnings
 
 from PIL import Image
 import pandas as pd
@@ -24,12 +25,9 @@ from .logging import reset_image_path_context, set_image_path_context
 from .observability import metrics_recorder
 from .settings import Settings
 
-try:
-    import pynvml
-except ImportError:  # pragma: no cover - optional dependency
-    pynvml = None
-
 _TRACER = otel_trace.get_tracer("eagle.ai.tagger.runtime")
+_PYNVML_AVAILABLE: bool | None = None  # None = not yet checked
+_PYNVML_MODULE: Any = None
 
 
 class TaggerRuntime:
@@ -141,38 +139,38 @@ class TaggerRuntime:
         try:
             with _TRACER.start_as_current_span("runtime.predict") as predict_span:
                 predict_span.set_attribute("runtime.provider", self.provider)
-                with _TRACER.start_as_current_span("image.preprocess"):
-                    with Image.open(resolved_path) as image:
-                        processed = ImageUtils.preprocess_image(image, self.target_size)
-                with _TRACER.start_as_current_span("onnx.inference"):
-                    scores = self.session.run([self.output_name], {self.input_name: processed})[0][0]
-                with _TRACER.start_as_current_span("tags.postprocess"):
-                    tags = self._postprocess_scores(
-                        scores=scores,
-                        threshold=self.settings.default_threshold if threshold is None else threshold,
-                        use_chinese_name=(
-                            self.settings.default_use_chinese_name
-                            if use_chinese_name is None
-                            else use_chinese_name
-                        ),
-                        top_k=self.settings.default_top_k if top_k is None else top_k,
+                try:
+                    with _TRACER.start_as_current_span("image.preprocess"):
+                        with Image.open(resolved_path) as image:
+                            processed = ImageUtils.preprocess_image(image, self.target_size)
+                    with _TRACER.start_as_current_span("onnx.inference"):
+                        scores = self.session.run([self.output_name], {self.input_name: processed})[0][0]
+                    with _TRACER.start_as_current_span("tags.postprocess"):
+                        tags = self._postprocess_scores(
+                            scores=scores,
+                            threshold=self.settings.default_threshold if threshold is None else threshold,
+                            use_chinese_name=(
+                                self.settings.default_use_chinese_name
+                                if use_chinese_name is None
+                                else use_chinese_name
+                            ),
+                            top_k=self.settings.default_top_k if top_k is None else top_k,
+                        )
+                    elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    predict_span.set_attribute("runtime.elapsed_ms", elapsed_ms)
+                    predict_span.set_attribute("runtime.tag_count", len(tags))
+                    self._record_gpu_metrics()
+                    logger.info(
+                        "runtime.predict.complete",
+                        provider=self.provider,
+                        elapsed_ms=elapsed_ms,
+                        tag_count=len(tags),
                     )
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                predict_span.set_attribute("runtime.elapsed_ms", elapsed_ms)
-                predict_span.set_attribute("runtime.tag_count", len(tags))
-                self._record_gpu_metrics()
-                logger.info(
-                    "runtime.predict.complete",
-                    provider=self.provider,
-                    elapsed_ms=elapsed_ms,
-                    tag_count=len(tags),
-                )
-                return resolved_path, tags, elapsed_ms
-        except Exception as exc:
-            current_span = otel_trace.get_current_span()
-            current_span.record_exception(exc)
-            current_span.set_status(Status(StatusCode.ERROR, str(exc)))
-            raise
+                    return resolved_path, tags, elapsed_ms
+                except Exception as exc:
+                    predict_span.record_exception(exc)
+                    predict_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                    raise
         finally:
             reset_image_path_context(image_ctx)
 
@@ -294,6 +292,7 @@ class TaggerRuntime:
         ]
 
     def _init_nvml(self) -> None:
+        pynvml = self._get_pynvml_module()
         if pynvml is None or self._nvml_initialized:
             return
         try:
@@ -304,6 +303,7 @@ class TaggerRuntime:
             logger.warning("nvml.init.failed", error=str(exc))
 
     def _read_gpu_memory(self) -> int | None:
+        pynvml = self._get_pynvml_module()
         if pynvml is None or not self._nvml_initialized or self._nvml_handle is None:
             return None
         try:
@@ -322,6 +322,7 @@ class TaggerRuntime:
         metrics_recorder().record_gpu(self.provider, memory_bytes)
 
     def shutdown(self) -> None:
+        pynvml = self._get_pynvml_module()
         if self._nvml_initialized and pynvml is not None:
             try:
                 pynvml.nvmlShutdown()
@@ -331,3 +332,20 @@ class TaggerRuntime:
             finally:
                 self._nvml_initialized = False
                 self._nvml_handle = None
+
+    @staticmethod
+    def _get_pynvml_module() -> Any | None:
+        global _PYNVML_AVAILABLE, _PYNVML_MODULE
+        if _PYNVML_AVAILABLE is False:
+            return None
+        if _PYNVML_AVAILABLE is None:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FutureWarning)
+                    import pynvml as pynvml_module
+                _PYNVML_MODULE = pynvml_module
+                _PYNVML_AVAILABLE = True
+            except ImportError:  # pragma: no cover - optional dependency
+                _PYNVML_AVAILABLE = False
+                return None
+        return _PYNVML_MODULE

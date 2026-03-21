@@ -21,7 +21,6 @@ from .logging import reset_request_context, set_request_context
 from .observability import metrics_recorder, observability_status, setup_observability, shutdown_observability
 
 SETTINGS = get_settings()
-SETTINGS.validate()
 RUNTIME = TaggerRuntime(SETTINGS)
 
 
@@ -39,7 +38,11 @@ def _http_exception_for_error(exc: Exception) -> HTTPException:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    RUNTIME.load()
+    try:
+        RUNTIME.load()
+    except Exception:
+        shutdown_observability()
+        raise
     try:
         yield
     finally:
