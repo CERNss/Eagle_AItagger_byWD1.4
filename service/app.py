@@ -40,10 +40,12 @@ def _http_exception_for_error(exc: Exception) -> HTTPException:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     RUNTIME.load()
-    yield
-    logger.info("service.shutdown")
-    RUNTIME.shutdown()
-    shutdown_observability()
+    try:
+        yield
+    finally:
+        logger.info("service.shutdown")
+        RUNTIME.shutdown()
+        shutdown_observability()
 
 
 app = FastAPI(title="Eagle AI Tagger Service", lifespan=lifespan)

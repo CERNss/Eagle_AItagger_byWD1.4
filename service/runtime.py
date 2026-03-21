@@ -5,10 +5,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-import onnxruntime as ort
 from PIL import Image
 import pandas as pd
 from loguru import logger
+from opentelemetry import trace as otel_trace
+from opentelemetry.trace import Status, StatusCode
+
+try:
+    import onnxruntime as ort
+except ImportError as exc:  # pragma: no cover - platform dependent in dev envs
+    ort = None
+    _ORT_IMPORT_ERROR = exc
+else:
+    _ORT_IMPORT_ERROR = None
 
 from .image_utils import ImageUtils
 from .logging import reset_image_path_context, set_image_path_context
@@ -20,6 +29,8 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     pynvml = None
 
+_TRACER = otel_trace.get_tracer("eagle.ai.tagger.runtime")
+
 
 class TaggerRuntime:
     RATING_TAG_COUNT = 4
@@ -27,7 +38,7 @@ class TaggerRuntime:
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.session: ort.InferenceSession | None = None
+        self.session: Any | None = None
         self.provider = "uninitialized"
         self.input_name = ""
         self.output_name = ""
@@ -40,46 +51,54 @@ class TaggerRuntime:
         self._nvml_handle = None
 
     def load(self) -> None:
-        self.settings.validate()
-        if not self.settings.model_path.exists():
-            raise FileNotFoundError(f"model file not found: {self.settings.model_path}")
-        if not self.settings.tags_path.exists():
-            raise FileNotFoundError(f"tags file not found: {self.settings.tags_path}")
+        with _TRACER.start_as_current_span("runtime.load") as span:
+            self.settings.validate()
+            if ort is None:
+                raise RuntimeError(
+                    "onnxruntime is not installed; install onnxruntime/onnxruntime-gpu for this platform"
+                ) from _ORT_IMPORT_ERROR
+            if not self.settings.model_path.exists():
+                raise FileNotFoundError(f"model file not found: {self.settings.model_path}")
+            if not self.settings.tags_path.exists():
+                raise FileNotFoundError(f"tags file not found: {self.settings.tags_path}")
 
-        available_providers = ort.get_available_providers()
-        providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if "CUDAExecutionProvider" in available_providers
-            else ["CPUExecutionProvider"]
-        )
+            available_providers = ort.get_available_providers()
+            providers = (
+                ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                if "CUDAExecutionProvider" in available_providers
+                else ["CPUExecutionProvider"]
+            )
 
-        self.session = ort.InferenceSession(str(self.settings.model_path), providers=providers)
-        self.provider = self.session.get_providers()[0]
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
-        self.target_size = self._resolve_target_size(self.session.get_inputs()[0].shape)
-        logger.info(
-            "runtime.loaded",
-            provider=self.provider,
-            model=self.settings.model_path.name,
-            tags_csv=self.settings.tags_path.name,
-        )
-        if "CUDA" in self.provider.upper():
-            self._init_nvml()
+            span.set_attribute("runtime.providers.available", ",".join(available_providers))
+            self.session = ort.InferenceSession(str(self.settings.model_path), providers=providers)
+            self.provider = self.session.get_providers()[0]
+            self.input_name = self.session.get_inputs()[0].name
+            self.output_name = self.session.get_outputs()[0].name
+            self.target_size = self._resolve_target_size(self.session.get_inputs()[0].shape)
+            span.set_attribute("runtime.provider", self.provider)
+            logger.info(
+                "runtime.loaded",
+                provider=self.provider,
+                model=self.settings.model_path.name,
+                tags_csv=self.settings.tags_path.name,
+            )
+            if "CUDA" in self.provider.upper():
+                self._init_nvml()
 
-        tags_df = pd.read_csv(self.settings.tags_path)
-        if "name" not in tags_df.columns:
-            raise ValueError("tags csv must include a 'name' column")
+            tags_df = pd.read_csv(self.settings.tags_path)
+            if "name" not in tags_df.columns:
+                raise ValueError("tags csv must include a 'name' column")
 
-        self.has_chinese_names = "right_tag_cn" in tags_df.columns
-        content_tags = tags_df.iloc[self.RATING_TAG_COUNT :]
-        self.english_names = content_tags["name"].fillna("").astype(str).tolist()
-        if self.has_chinese_names:
-            self.chinese_names = content_tags["right_tag_cn"].fillna("").astype(str).tolist()
-        else:
-            self.chinese_names = self.english_names[:]
+            self.has_chinese_names = "right_tag_cn" in tags_df.columns
+            content_tags = tags_df.iloc[self.RATING_TAG_COUNT :]
+            self.english_names = content_tags["name"].fillna("").astype(str).tolist()
+            if self.has_chinese_names:
+                self.chinese_names = content_tags["right_tag_cn"].fillna("").astype(str).tolist()
+            else:
+                self.chinese_names = self.english_names[:]
 
-        self.is_loaded = True
+            self.is_loaded = True
+            span.set_attribute("runtime.loaded", True)
 
     def _resolve_target_size(self, shape: list[Any]) -> int:
         for dim in shape[1:3]:
@@ -120,29 +139,40 @@ class TaggerRuntime:
         image_ctx = set_image_path_context(resolved_path)
         started = time.perf_counter()
         try:
-            with Image.open(resolved_path) as image:
-                processed = ImageUtils.preprocess_image(image, self.target_size)
-            scores = self.session.run([self.output_name], {self.input_name: processed})[0][0]
-
-            tags = self._postprocess_scores(
-                scores=scores,
-                threshold=self.settings.default_threshold if threshold is None else threshold,
-                use_chinese_name=(
-                    self.settings.default_use_chinese_name
-                    if use_chinese_name is None
-                    else use_chinese_name
-                ),
-                top_k=self.settings.default_top_k if top_k is None else top_k,
-            )
-            elapsed_ms = int((time.perf_counter() - started) * 1000)
-            self._record_gpu_metrics()
-            logger.info(
-                "runtime.predict.complete",
-                provider=self.provider,
-                elapsed_ms=elapsed_ms,
-                tag_count=len(tags),
-            )
-            return resolved_path, tags, elapsed_ms
+            with _TRACER.start_as_current_span("runtime.predict") as predict_span:
+                predict_span.set_attribute("runtime.provider", self.provider)
+                with _TRACER.start_as_current_span("image.preprocess"):
+                    with Image.open(resolved_path) as image:
+                        processed = ImageUtils.preprocess_image(image, self.target_size)
+                with _TRACER.start_as_current_span("onnx.inference"):
+                    scores = self.session.run([self.output_name], {self.input_name: processed})[0][0]
+                with _TRACER.start_as_current_span("tags.postprocess"):
+                    tags = self._postprocess_scores(
+                        scores=scores,
+                        threshold=self.settings.default_threshold if threshold is None else threshold,
+                        use_chinese_name=(
+                            self.settings.default_use_chinese_name
+                            if use_chinese_name is None
+                            else use_chinese_name
+                        ),
+                        top_k=self.settings.default_top_k if top_k is None else top_k,
+                    )
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                predict_span.set_attribute("runtime.elapsed_ms", elapsed_ms)
+                predict_span.set_attribute("runtime.tag_count", len(tags))
+                self._record_gpu_metrics()
+                logger.info(
+                    "runtime.predict.complete",
+                    provider=self.provider,
+                    elapsed_ms=elapsed_ms,
+                    tag_count=len(tags),
+                )
+                return resolved_path, tags, elapsed_ms
+        except Exception as exc:
+            current_span = otel_trace.get_current_span()
+            current_span.record_exception(exc)
+            current_span.set_status(Status(StatusCode.ERROR, str(exc)))
+            raise
         finally:
             reset_image_path_context(image_ctx)
 
@@ -158,48 +188,51 @@ class TaggerRuntime:
                 f"batch size {len(image_paths)} exceeds configured limit {self.settings.batch_limit}"
             )
 
-        results: list[dict[str, Any]] = []
-        for image_path in image_paths:
-            try:
-                resolved_path, tags, elapsed_ms = self.predict(
-                    image_path=image_path,
-                    threshold=threshold,
-                    use_chinese_name=use_chinese_name,
-                    top_k=top_k,
-                )
-                results.append(
-                    {
-                        "image_path": str(resolved_path),
-                        "success": True,
-                        "tags": tags,
-                        "elapsed_ms": elapsed_ms,
-                        "error": None,
-                    }
-                )
-            except Exception as exc:
-                results.append(
-                    {
-                        "image_path": str(image_path),
-                        "success": False,
-                        "tags": [],
-                        "elapsed_ms": None,
-                        "error": str(exc),
-                        "error_type": exc.__class__.__name__,
-                    }
-                )
-                logger.warning(
-                    "runtime.predict.failed",
-                    error=str(exc),
-                    error_type=exc.__class__.__name__,
-                )
-        failure_count = sum(1 for item in results if not item["success"])
-        logger.info(
-            "runtime.predict_batch.complete",
-            total=len(image_paths),
-            failures=failure_count,
-            provider=self.provider,
-        )
-        return results
+        with _TRACER.start_as_current_span("runtime.predict_batch") as span:
+            span.set_attribute("runtime.batch_size", len(image_paths))
+            results: list[dict[str, Any]] = []
+            for image_path in image_paths:
+                try:
+                    resolved_path, tags, elapsed_ms = self.predict(
+                        image_path=image_path,
+                        threshold=threshold,
+                        use_chinese_name=use_chinese_name,
+                        top_k=top_k,
+                    )
+                    results.append(
+                        {
+                            "image_path": str(resolved_path),
+                            "success": True,
+                            "tags": tags,
+                            "elapsed_ms": elapsed_ms,
+                            "error": None,
+                        }
+                    )
+                except Exception as exc:
+                    results.append(
+                        {
+                            "image_path": str(image_path),
+                            "success": False,
+                            "tags": [],
+                            "elapsed_ms": None,
+                            "error": str(exc),
+                            "error_type": exc.__class__.__name__,
+                        }
+                    )
+                    logger.warning(
+                        "runtime.predict.failed",
+                        error=str(exc),
+                        error_type=exc.__class__.__name__,
+                    )
+            failure_count = sum(1 for item in results if not item["success"])
+            span.set_attribute("runtime.failures", failure_count)
+            logger.info(
+                "runtime.predict_batch.complete",
+                total=len(image_paths),
+                failures=failure_count,
+                provider=self.provider,
+            )
+            return results
 
     def _postprocess_scores(
         self,
