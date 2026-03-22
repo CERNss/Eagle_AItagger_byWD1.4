@@ -9,10 +9,5 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-if docker compose version >/dev/null 2>&1; then
-  echo "Building image with docker compose..."
-  docker compose build "$@"
-else
-  echo "docker compose not found, falling back to docker build..."
-  docker build "$@" -t eagle-ai-tagger:latest -f Dockerfile .
-fi
+echo "Building linux/amd64 image with buildx..."
+docker buildx build --platform linux/amd64 -t eagle-ai-tagger:latest --load .
