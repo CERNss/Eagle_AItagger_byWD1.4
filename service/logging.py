@@ -47,6 +47,7 @@ def setup_logging(settings: Settings) -> None:
 
     logger.remove()
     logger.configure(
+        patcher=_patch_record,
         extra={
             "service.name": observability.service_name,
             "service.version": observability.service_version,
@@ -61,7 +62,6 @@ def setup_logging(settings: Settings) -> None:
         enqueue=True,
         backtrace=False,
         diagnose=False,
-        patcher=_patch_record,
     )
 
     logging.basicConfig(handlers=[intercept], level=0, force=True)

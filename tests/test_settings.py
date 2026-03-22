@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from service.settings import Settings
@@ -39,3 +37,21 @@ def test_invalid_trace_sample_ratio(monkeypatch):
     settings = Settings.from_env()
     with pytest.raises(ValueError):
         settings.validate()
+
+
+def test_tracing_requires_exporter_endpoint(monkeypatch):
+    monkeypatch.setenv("OTEL_ENABLED", "1")
+    monkeypatch.delenv("OTEL_EXPORTER_ENDPOINT", raising=False)
+    settings = Settings.from_env()
+    with pytest.raises(ValueError):
+        settings.validate()
+
+
+def test_metrics_can_reuse_trace_exporter_endpoint(monkeypatch):
+    monkeypatch.setenv("OTEL_ENABLED", "1")
+    monkeypatch.setenv("OTEL_METRICS_ENABLED", "1")
+    monkeypatch.setenv("OTEL_EXPORTER_ENDPOINT", "http://collector:4318")
+    monkeypatch.delenv("OTEL_METRICS_EXPORTER_ENDPOINT", raising=False)
+    settings = Settings.from_env()
+    settings.validate()
+    assert settings.observability.metrics.exporter_endpoint == "http://collector:4318"
