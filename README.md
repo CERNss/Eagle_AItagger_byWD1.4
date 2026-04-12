@@ -130,6 +130,12 @@ The provided Compose file expects:
 - tag CSV at `./csv/Tags-cn_2024_ver-1.0.csv`
 - images shared from `/srv/shared-images` on the host
 
+Compose mounts those directories into the container as:
+
+- `/model/swinv2-v3.onnx`
+- `/csv/Tags-cn_2024_ver-1.0.csv`
+- `/data/images`
+
 Start the service:
 
 ```bash

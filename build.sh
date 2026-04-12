@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 IMAGE_NAME="${IMAGE_NAME:-eagle-ai-tagger}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 LOCAL_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
-REGISTRY="${REGISTRY:-registry.esxi.local.qkzx.top:5000}"
+REGISTRY="${REGISTRY:-${REMOTE_REGISTRY:-192.168.10.142:5000}}"
 REMOTE_IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
 
 if ! command -v docker >/dev/null 2>&1; then

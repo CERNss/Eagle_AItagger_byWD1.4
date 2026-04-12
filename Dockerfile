@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+RUN mkdir -p /model /csv /data/images
+
 COPY requirements.txt requirements.txt
 RUN python3 -m pip install --upgrade pip setuptools wheel \
     && python3 -m pip install -r requirements.txt

@@ -30,6 +30,13 @@ def test_observability_defaults(monkeypatch):
     assert obs.metrics.enabled is False
 
 
+def test_model_and_tag_path_defaults(monkeypatch):
+    _clear_env(monkeypatch, ["MODEL_PATH", "TAGS_PATH"])
+    settings = Settings.from_env()
+    assert str(settings.model_path) == "model/swinv2-v3.onnx"
+    assert str(settings.tags_path) == "csv/Tags-cn_2024_ver-1.0.csv"
+
+
 def test_invalid_trace_sample_ratio(monkeypatch):
     monkeypatch.setenv("OTEL_ENABLED", "1")
     monkeypatch.setenv("OTEL_EXPORTER_ENDPOINT", "http://collector:4318")
