@@ -163,9 +163,11 @@ docker run --rm --gpus all nvidia/cuda:12.9.0-base-ubuntu22.04 nvidia-smi
 
 ## Release Image
 
-CI runs tests and configuration checks on branch pushes and pull requests. Container publishing is tag-driven: pushing a Git tag that starts with `v` builds and pushes the image to GitHub Container Registry.
+CI runs tests and configuration checks on branch pushes and pull requests. Container publishing is tag-driven and gated to `develop`: pushing a Git tag that starts with `v` builds and pushes the image only when the tagged commit is contained in `origin/develop`.
 
 ```bash
+git switch develop
+git pull --ff-only origin develop
 git tag v0.1.0
 git push origin v0.1.0
 ```
@@ -176,7 +178,7 @@ The published image is tagged with the Git tag, for example:
 ghcr.io/cernss/eagle_aitagger_bywd1.4:v0.1.0
 ```
 
-Manual publishing is also available from the GitHub Actions `CI/CD` workflow dispatch form.
+Manual publishing is also available from the GitHub Actions `CI/CD` workflow dispatch form, but it must be run from the `develop` branch.
 
 ## API
 

@@ -167,7 +167,7 @@ Docker Compose sets `REQUIRE_CUDA=true` and uses a longer readiness start period
 
 Use `init.sh` to download the model and prepare the image root. Use `build.sh` when publishing the image to the configured private registry.
 
-GitHub Actions packaging is tag-driven. Branch pushes and PRs run checks only; pushing a tag matching `v*` builds and pushes the container image to GitHub Container Registry with the Git tag as the image tag.
+GitHub Actions packaging is tag-driven and gated to `develop`. Branch pushes and PRs run checks only; pushing a tag matching `v*` builds and pushes the container image only when the tagged commit is contained in `origin/develop`.
 
 ---
 
