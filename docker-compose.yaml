@@ -25,7 +25,7 @@ services:
     volumes:
       - ./model:/model:ro
       - ./csv:/csv:ro
-      - /data/app/shared-images:/data/images:ro
+      - ${IMAGE_ROOT:-/srv/shared-images}:/data/images:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/readyz"]
       interval: 30s

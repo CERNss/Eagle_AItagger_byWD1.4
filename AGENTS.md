@@ -1,215 +1,226 @@
-# AGENTS.md — Eagle AI Tagger System Spec
+# AGENTS.md - Eagle AI Tagger System Spec
 
 ## Project Overview
 
-WD14 (WaifuDiffusion 1.4) model-based image auto-tagging tool for Eagle asset manager. Performs GPU-accelerated ONNX inference to generate tags (Chinese/English) for images, writing results into Eagle's `metadata.json` per-image structure.
+WD14 image tagging service for Eagle-style image libraries. The current repository is a Linux-first FastAPI microservice: it loads a WD14 ONNX model once, accepts image filesystem paths over HTTP, runs ONNX Runtime inference, and returns Chinese/English tag results as JSON.
 
-**Target platform**: Linux + NVIDIA GPU + Docker (migrating from Windows desktop usage)
-**Runtime**: Python 3.8+, ONNX Runtime GPU, CUDA 12.x
+The service no longer writes Eagle `metadata.json` files directly. Downstream services should call the HTTP API and decide how to persist returned tags.
+
+**Target platform**: Linux + NVIDIA GPU + Docker
+**Runtime**: Python 3.10+, FastAPI, ONNX Runtime GPU, CUDA 12.x
 
 ---
 
-## Architecture
+## Current Architecture
 
 ### Entry Points
 
 | File | Role | Notes |
 |---|---|---|
-| `main.py` | CLI entry point | argparse: `--config`, `--image_list` |
-| `run.bat` | Windows launcher | **TO BE REMOVED** — replace with Dockerfile CMD or `run.sh` |
-| `uptags.py` | Standalone tool | Batch-updates existing Eagle tags (English -> Chinese) |
+| `main.py` | Local service runner | Loads env settings, validates them, starts Uvicorn with one worker |
+| `service/app.py` | FastAPI app | Defines lifecycle, middleware, health/readiness, tag APIs |
+| `scripts/smoke_test.py` | Operational smoke test | Calls `/healthz` and optionally `/tag` |
+| `init.sh` | Asset/bootstrap helper | Downloads model assets and prepares local image directory |
+| `build.sh` | Image build/push helper | Builds linux/amd64 Docker image and pushes to registry |
 
-### Core Modules (`main/`)
+### Core Modules (`service/`)
 
-```
+```text
 main.py
-  -> main/mainp.py          # Orchestrator: loads config, dispatches work, collects results
-      -> unified_config.py   # Config system (INI -> dataclasses)
-      -> task_dispatcher.py  # Batch creation + adaptive batch sizing
-      -> process_pool_manager.py  # Multiprocessing pool lifecycle
-          -> manager.py      # Worker process: loads model, processes batches
-              -> tagger.py   # ONNX inference + tag processing
-              -> image_utils.py  # PIL/OpenCV image preprocessing
-      -> result_collector.py # Aggregates results, writes JSON, generates reports
-      -> progress_monitor.py # Real-time progress display (background thread)
-      -> check_update.py     # GitHub version checker
+  -> service/settings.py       # Environment-driven typed settings
+  -> service/app.py            # FastAPI app, request context, HTTP error mapping
+      -> service/runtime.py    # ONNX session lifecycle, image path checks, inference, tag post-processing
+          -> service/image_utils.py  # PIL/OpenCV WD14 preprocessing
+      -> service/schemas.py    # Pydantic request/response models
+      -> service/logging.py    # Loguru setup, request id/image path context, stdlib log interception
+      -> service/observability.py # OpenTelemetry tracing/metrics setup and metric recording
 ```
 
-### Data Flow
+### Request Flow
 
+```text
+HTTP client
+  -> POST /tag or /tag/batch
+  -> FastAPI middleware adds x-request-id and logging context
+  -> TaggerRuntime.resolve_image_path()
+      -> expands relative paths against IMAGE_ROOT when configured
+      -> rejects paths outside IMAGE_ROOT
+  -> ImageUtils.preprocess_image()
+      -> transparent background fill
+      -> square padding
+      -> resize to model input size
+  -> ONNX Runtime InferenceSession.run()
+  -> tag post-processing
+      -> skip first 4 rating outputs
+      -> threshold/filter/add/exclude tags
+      -> choose `right_tag_cn` or `name`
+      -> underscore replacement, optional escaping, sorting, top_k
+  <- JSON response with provider, image_path, tags, elapsed_ms
 ```
-image_list.txt (file paths)
-  -> mainp.py: parse paths -> [{image_path, json_path}, ...]
-  -> task_dispatcher.py: split into batches
-  -> process_pool_manager.py: distribute via mp.Queue
-  -> manager.py (N worker processes, each loads own ONNX model):
-      -> tagger.py: ONNX inference -> raw tags
-      -> tagger.py: filter by threshold, exclude/include, sort
-  <- result_queue: collect batch results
-  -> result_collector.py: merge results, write to Eagle metadata.json files
-  -> progress_monitor.py: display progress bar (background thread)
-```
 
-### Multiprocessing Model
+### Runtime Model
 
-- `ProcessPoolManager` spawns N `worker_process` instances (N = `config.process.max_workers`)
-- Each worker independently loads the ONNX model into GPU memory
-- Communication: `mp.Queue` for task dispatch and result collection
-- Worker health monitoring: timeout detection, automatic restart of dead workers
-- **Important for Linux**: default `start_method` is `fork`; may need `spawn` if CUDA context issues arise
+- One Uvicorn worker by default. Do not increase Uvicorn workers casually because each worker loads its own model copy into memory.
+- `TaggerRuntime` owns one ONNX Runtime `InferenceSession`.
+- Provider selection is CUDA-first when `CUDAExecutionProvider` is available, otherwise CPU fallback.
+- `/tag/batch` processes paths sequentially through the same runtime and returns item-level errors for invalid images.
+- Optional NVML sampling records GPU memory usage when CUDA and `pynvml` are available.
 
-### ONNX Inference (`tagger.py`)
+---
 
-- Provider chain: `['CUDAExecutionProvider', 'CPUExecutionProvider']` — auto-fallback already implemented
-- Model input: preprocessed image tensor `(1, H, W, 3)` float32
-- Model output: confidence array aligned with tag CSV
-- Tags split: first 4 = ratings, rest = content tags
-- Supports Chinese (`right_tag_cn`) and English (`name`) tag columns
+## HTTP API
 
-### Config System (`unified_config.py`)
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/healthz` | Process health, model/tag paths, provider, observability status |
+| `GET` | `/readyz` | Returns 200 only after runtime load succeeds |
+| `POST` | `/tag` | Tag one image path |
+| `POST` | `/tag/batch` | Tag up to `BATCH_LIMIT` image paths |
 
-INI file parsed into typed dataclasses:
+The API accepts filesystem paths, not file uploads. If `IMAGE_ROOT` is set, requested paths must resolve inside that root.
 
-- `VersionConfig`: version, update_notes
-- `ModelConfig`: model_path (Path), tags_path (Path)
-- `TagConfig`: threshold, replace_underscore, escape_tags, use_chinese_name, additional/exclude tags, sort order
-- `ProcessConfig`: max_workers, batch_size, max_retries, checkpoint_interval, add_write_mode
-- `ReportConfig`: create_csv_report
+---
 
-Config is serialized to dict via `to_dict()` for passing through multiprocessing queues.
+## Configuration
+
+Settings are read from environment variables in `service/settings.py`.
+
+### Core Settings
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HOST` | `0.0.0.0` | Bind address for local `python main.py` runs |
+| `PORT` | `8000` | HTTP port |
+| `MODEL_PATH` | `model/swinv2-v3.onnx` | ONNX model path |
+| `TAGS_PATH` | `csv/Tags-cn_2024_ver-1.0.csv` | Tag CSV path |
+| `IMAGE_ROOT` | unset | Optional root directory restriction for image paths |
+| `DEFAULT_THRESHOLD` | `0.5` | Default score threshold |
+| `USE_CHINESE_NAME` | `true` | Use `right_tag_cn` when present |
+| `DEFAULT_TOP_K` | `50` | Default max returned tag count |
+| `BATCH_LIMIT` | `64` | Maximum `/tag/batch` size |
+| `REPLACE_UNDERSCORE` | `true` | Replace `_` with spaces in returned tags |
+| `UNDERSCORE_EXCLUDES` | empty | Comma-separated tags that keep underscores |
+| `ESCAPE_TAGS` | `false` | Escape backslash and parentheses |
+| `ADDITIONAL_TAGS` | empty | Comma-separated tags appended with score `1.0` |
+| `EXCLUDE_TAGS` | empty | Comma-separated tags filtered out |
+| `SORT_ALPHABETICALLY` | `false` | Sort alphabetically instead of score descending |
+
+### Observability Settings
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Log level |
+| `LOG_FORMAT` | `json` | `json` or `text` |
+| `LOG_INCLUDE_TRACE` | `true` | Include trace/span ids in logs when available |
+| `LOG_HASH_IMAGE_PATHS` | `true` | Hash image paths in logs |
+| `SERVICE_NAME` | `eagle-ai-tagger` | OpenTelemetry service name |
+| `SERVICE_VERSION` | `dev` | OpenTelemetry service version |
+| `DEPLOYMENT_ENVIRONMENT` | `development` | OpenTelemetry deployment environment |
+| `OTEL_ENABLED` | `false` | Enable tracing |
+| `OTEL_EXPORTER_ENDPOINT` | unset | OTLP/HTTP trace endpoint |
+| `OTEL_EXPORTER_HEADERS` | unset | Comma-separated `key=value` headers |
+| `OTEL_TRACE_SAMPLE_RATIO` | `0.1` | Trace sampling ratio |
+| `OTEL_METRICS_ENABLED` | `false` | Enable metrics |
+| `OTEL_METRICS_EXPORTER_ENDPOINT` | trace endpoint | Optional metrics endpoint override |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `60` | Metric export interval in seconds |
 
 ---
 
 ## Dependencies
 
-### Core (required)
+### Runtime
 
 | Package | Purpose |
 |---|---|
-| `onnxruntime-gpu` | ONNX model inference with CUDA |
-| `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cudnn-cu12`, etc. | CUDA runtime libraries |
-| `opencv-python` | Image I/O and preprocessing |
-| `pillow` | Image loading and format handling |
-| `numpy` | Array operations |
-| `pandas` | Tag CSV loading and mapping |
-| `requests` | Version check (GitHub) |
-| `packaging` | Version comparison |
-| `psutil` | System monitoring |
-| `pynvml` | NVIDIA GPU monitoring |
+| `fastapi`, `uvicorn[standard]` | HTTP service |
+| `onnxruntime-gpu` | ONNX model inference with CUDA support |
+| `opencv-python-headless`, `pillow`, `numpy` | Image preprocessing |
+| `pandas` | Tag CSV loading |
+| `loguru` | Structured logging |
+| `opentelemetry-*` | Optional tracing and metrics |
+| `pynvml` | Optional NVIDIA GPU memory metrics |
 
-### Suspicious / Likely Unnecessary
+### Development
 
-| Package | Issue |
-|---|---|
-| `torch` | **No `import torch` anywhere in codebase**. ~2GB. Likely vestigial. Verify and remove. |
-| `xformers` | **No `import xformers` anywhere in codebase**. Likely vestigial. Verify and remove. |
-| `pyreadline3` | **Windows-only**. Must remove for Linux. |
-| `tzdata` | Windows needs this for timezone; Linux has system tzdata. Can remove. |
-
-### requirements.txt Encoding Issue
-
-File is **UTF-16LE with BOM** (not UTF-8). Will cause `pip install -r` failures in many Linux/Docker environments. Must re-encode to UTF-8.
+- `requirements-dev.txt` includes runtime dependencies plus `pytest`, `httpx`, and `requests`.
+- Current tests focus on settings validation in `tests/test_settings.py`.
 
 ---
 
-## Eagle Integration
+## Docker And Assets
 
-Eagle is a desktop asset management app. Its library structure:
+Default Docker Compose behavior:
 
-```
-<library>.library/
-  backup/
-  images/
-    <HASH>.info/
-      <filename>.png       # The image
-      metadata.json        # Tags written here
-  actions.json
-  metadata.json
-  mtime.json
-  saved-filters.json
-  tags.json
-```
+- model: `./model/swinv2-v3.onnx` -> `/model/swinv2-v3.onnx`
+- tags: `./csv/Tags-cn_2024_ver-1.0.csv` -> `/csv/Tags-cn_2024_ver-1.0.csv`
+- images: `${IMAGE_ROOT:-/srv/shared-images}` -> `/data/images`
 
-This tool reads image paths from `image_list.txt`, runs inference, and writes tags back to each image's `metadata.json`.
+Inside the container, `MODEL_PATH`, `TAGS_PATH`, and `IMAGE_ROOT` are set to `/model/swinv2-v3.onnx`, `/csv/Tags-cn_2024_ver-1.0.csv`, and `/data/images`.
 
-The `uptags.py` tool separately scans an entire Eagle library to batch-update English tags to Chinese using the CSV mapping table.
+Use `init.sh` to download the model and prepare the image root. Use `build.sh` when publishing the image to the configured private registry.
 
 ---
 
-## Migration Status: Windows -> Linux
+## Testing And Verification
 
-### Already Cross-Platform (no changes needed)
+Preferred local checks:
 
-- All `main/` module path handling uses `pathlib.Path`
-- ONNX provider fallback chain
-- Multiprocessing architecture (standard `mp`)
-- Config system (`configparser` + dataclasses)
-- Image processing pipeline (PIL + OpenCV + numpy)
-- JSON/CSV I/O
+```bash
+.venv/bin/python -m pytest -q
+python3 scripts/smoke_test.py
+python3 scripts/smoke_test.py --image-path /absolute/path/to/image.png
+```
 
-### Must Fix (blocking for Linux/Docker)
+Container/GPU checks:
 
-| Item | File | Line(s) | Issue |
-|---|---|---|---|
-| `input()` blocks | `mainp.py` | 44, 105 | Hangs in headless container (no tty) |
-| `input()` blocks | `check_update.py` | 60 | Hangs in headless container |
-| requirements.txt encoding | root | — | UTF-16LE, must convert to UTF-8 |
-| `pyreadline3` dependency | requirements.txt | — | Windows-only, crashes on Linux |
-
-### Should Fix (functional issues on Linux)
-
-| Item | File | Line(s) | Issue |
-|---|---|---|---|
-| Hardcoded `\` path | `uptags.py` | 151 | `r"csv\Tags-cn_2024_ver-1.0.csv"` — not a valid Linux path |
-| `input()` in uptags | `uptags.py` | 39, 188 | Interactive prompts, problematic if containerized |
-| Version check writes temp file | `check_update.py` | 31-40 | Writes `temp_remote_config.ini` to CWD, fragile in containers |
-
-### Should Remove
-
-| Item | Reason |
-|---|---|
-| `run.bat` | Windows-only launcher |
-| `old-version/` directory | Unused legacy code with Windows-specific patterns |
-| `torch`, `xformers` in requirements | Not imported, ~2GB bloat |
-
-### Recommended Additions (for Docker/service mode)
-
-- `run.sh` or Dockerfile `CMD ["python", "main.py"]`
-- `logging` module instead of `print()` (for structured log collection)
-- Explicit `mp.set_start_method('spawn')` if CUDA fork issues arise
-- Configurable output paths for reports (currently hardcoded filenames)
-- Health check endpoint if exposing as HTTP/gRPC service later
+```bash
+nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.9.0-base-ubuntu22.04 nvidia-smi
+docker compose up --build
+curl http://127.0.0.1:8000/readyz
+```
 
 ---
 
-## File Tree
+## Repository Layout
 
-```
+```text
 .
-+-- main.py                  # CLI entry point
-+-- config.ini               # Runtime configuration
-+-- image_list.txt           # Input: image paths (one per line)
-+-- requirements.txt         # Python dependencies (NEEDS UTF-8 re-encode)
-+-- run.bat                  # Windows launcher (TO REMOVE)
-+-- uptags.py                # Standalone tag migration tool
-+-- AGENTS.md                # This file
-+-- README.md                # User documentation (NEEDS Linux rewrite)
++-- main.py
++-- service/
+|   +-- app.py
+|   +-- runtime.py
+|   +-- schemas.py
+|   +-- settings.py
+|   +-- image_utils.py
+|   +-- logging.py
+|   +-- observability.py
++-- scripts/
+|   +-- smoke_test.py
++-- tests/
+|   +-- conftest.py
+|   +-- test_settings.py
 +-- csv/
-|   +-- Tags-cn_2024_ver-1.0.csv   # Tag dictionary (English + Chinese)
-|   +-- ...archived dicts
+|   +-- Tags-cn_2024_ver-1.0.csv
 +-- model/
-|   +-- (*.onnx files go here)
-+-- main/
-|   +-- __init__.py
-|   +-- mainp.py             # Orchestrator
-|   +-- unified_config.py    # Config dataclasses
-|   +-- tagger.py            # ONNX inference engine
-|   +-- image_utils.py       # Image preprocessing
-|   +-- manager.py           # Worker process logic
-|   +-- process_pool_manager.py  # Process pool lifecycle
-|   +-- task_dispatcher.py   # Batch creation/sizing
-|   +-- result_collector.py  # Result aggregation + JSON writing
-|   +-- progress_monitor.py  # Progress display thread
-|   +-- check_update.py      # Version checker
-+-- old-version/             # Legacy code (TO REMOVE)
+|   +-- swinv2-v3.onnx  # user-provided/downloaded, not committed
++-- Dockerfile
++-- docker-compose.yaml
++-- init.sh
++-- build.sh
++-- requirements.txt
++-- requirements-dev.txt
++-- README.md
++-- AGENTS.md
++-- openspec/
 ```
+
+---
+
+## Notes For Future Agents
+
+- Treat `service/` as the source of truth. The old Windows batch workflow is no longer present in the active tree.
+- Keep the service single-process unless explicitly changing model lifecycle and GPU memory behavior.
+- Do not add direct Eagle `metadata.json` mutation back into this service unless the API contract changes intentionally.
+- Prefer tests around settings, path safety, tag post-processing, API error mapping, and observability status when changing behavior.
+- Preserve path privacy in logs unless a deployment explicitly disables `LOG_HASH_IMAGE_PATHS`.

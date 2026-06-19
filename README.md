@@ -128,13 +128,19 @@ The provided Compose file expects:
 
 - model file at `./model/swinv2-v3.onnx`
 - tag CSV at `./csv/Tags-cn_2024_ver-1.0.csv`
-- images shared from `/srv/shared-images` on the host
+- images shared from `${IMAGE_ROOT:-/srv/shared-images}` on the host
 
 Compose mounts those directories into the container as:
 
 - `/model/swinv2-v3.onnx`
 - `/csv/Tags-cn_2024_ver-1.0.csv`
 - `/data/images`
+
+Use a custom host image directory by setting `IMAGE_ROOT` for Compose:
+
+```bash
+IMAGE_ROOT=/path/to/shared-images docker compose up --build
+```
 
 Start the service:
 
