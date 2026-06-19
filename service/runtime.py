@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,10 @@ _PYNVML_AVAILABLE: bool | None = None  # None = not yet checked
 _PYNVML_MODULE: Any = None
 
 
+class InferenceBusyError(RuntimeError):
+    """Raised when all inference slots stay busy past the configured timeout."""
+
+
 class TaggerRuntime:
     RATING_TAG_COUNT = 4
     TAG_ESCAPE_PATTERN = re.compile(r"([\\()])")
@@ -47,6 +52,7 @@ class TaggerRuntime:
         self.chinese_names: list[str] = []
         self._nvml_initialized = False
         self._nvml_handle = None
+        self._inference_slots = threading.BoundedSemaphore(settings.max_concurrent_inference)
 
     def load(self) -> None:
         with _TRACER.start_as_current_span("runtime.load") as span:
@@ -70,6 +76,10 @@ class TaggerRuntime:
             span.set_attribute("runtime.providers.available", ",".join(available_providers))
             self.session = ort.InferenceSession(str(self.settings.model_path), providers=providers)
             self.provider = self.session.get_providers()[0]
+            if self.settings.require_cuda and "CUDA" not in self.provider.upper():
+                raise RuntimeError(
+                    f"CUDAExecutionProvider is required but runtime selected {self.provider}"
+                )
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
             self.target_size = self._resolve_target_size(self.session.get_inputs()[0].shape)
@@ -95,6 +105,9 @@ class TaggerRuntime:
             else:
                 self.chinese_names = self.english_names[:]
 
+            if self.settings.startup_self_check:
+                self._validate_model_output_shape()
+
             self.is_loaded = True
             span.set_attribute("runtime.loaded", True)
 
@@ -103,6 +116,34 @@ class TaggerRuntime:
             if isinstance(dim, int):
                 return dim
         raise ValueError(f"unable to determine target image size from model input shape: {shape}")
+
+    def _validate_model_output_shape(self) -> None:
+        if self.session is None:
+            raise RuntimeError("runtime session is not initialized")
+        outputs = self.session.get_outputs()
+        if not outputs:
+            raise ValueError("model must expose at least one output")
+        output_shape = outputs[0].shape
+        label_count = len(self.english_names) + self.RATING_TAG_COUNT
+        output_count = self._resolve_output_count(output_shape)
+        if output_count is None:
+            logger.warning(
+                "runtime.self_check.output_shape_dynamic",
+                output_shape=str(output_shape),
+                expected_labels=label_count,
+            )
+            return
+        if output_count != label_count:
+            raise ValueError(
+                "model output label count mismatch: "
+                f"output has {output_count} scores, tags csv expects {label_count}"
+            )
+
+    @staticmethod
+    def _resolve_output_count(shape: list[Any]) -> int | None:
+        if shape and isinstance(shape[-1], int):
+            return shape[-1]
+        return None
 
     def resolve_image_path(self, image_path: str | Path) -> Path:
         candidate = Path(image_path).expanduser()
@@ -136,7 +177,13 @@ class TaggerRuntime:
         resolved_path = self.resolve_image_path(image_path)
         image_ctx = set_image_path_context(resolved_path)
         started = time.perf_counter()
+        acquired = False
         try:
+            acquired = self._inference_slots.acquire(timeout=self.settings.inference_acquire_timeout_seconds)
+            if not acquired:
+                raise InferenceBusyError(
+                    "inference capacity is exhausted; retry after the current request completes"
+                )
             with _TRACER.start_as_current_span("runtime.predict") as predict_span:
                 predict_span.set_attribute("runtime.provider", self.provider)
                 try:
@@ -172,6 +219,8 @@ class TaggerRuntime:
                     predict_span.set_status(Status(StatusCode.ERROR, str(exc)))
                     raise
         finally:
+            if acquired:
+                self._inference_slots.release()
             reset_image_path_context(image_ctx)
 
     def predict_batch(
@@ -261,7 +310,7 @@ class TaggerRuntime:
         }
 
         for tag in self.settings.additional_tags:
-            raw_tags.setdefault(tag, 1.0)
+            raw_tags[tag] = max(raw_tags.get(tag, 0.0), 1.0)
 
         filtered = {
             tag: score

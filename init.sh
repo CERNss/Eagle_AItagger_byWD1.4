@@ -125,14 +125,29 @@ download_file() {
   fi
 
   echo "Downloading -> $output"
+  local tmp_output="${output}.tmp.$$"
+  rm -f "$tmp_output"
   if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$output" "$url"
+    if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$tmp_output" "$url"; then
+      rm -f "$tmp_output"
+      return 1
+    fi
   elif command -v wget >/dev/null 2>&1; then
-    wget -O "$output" "$url"
+    if ! wget -O "$tmp_output" "$url"; then
+      rm -f "$tmp_output"
+      return 1
+    fi
   else
     echo "Either curl or wget is required for download." >&2
+    rm -f "$tmp_output"
     return 1
   fi
+  if [[ ! -s "$tmp_output" ]]; then
+    echo "Downloaded file is empty: $url" >&2
+    rm -f "$tmp_output"
+    return 1
+  fi
+  mv "$tmp_output" "$output"
 }
 
 sync_image() {
@@ -168,7 +183,7 @@ else
   IMAGE_ROOT="${ROOT_DIR}/data/images"
   mkdir -p "$IMAGE_ROOT"
   echo "No permission to create /srv path, fallback IMAGE_ROOT: $IMAGE_ROOT"
-  echo "Remember to update docker-compose.yaml volume mapping if needed."
+  echo "Use IMAGE_ROOT=\"$IMAGE_ROOT\" docker compose up -d for this fallback path."
 fi
 
 sync_image
@@ -184,5 +199,5 @@ Local img:  ${LOCAL_IMAGE}
 
 Next steps:
   1) ./build.sh
-  2) docker compose up -d
+  2) IMAGE_ROOT="$IMAGE_ROOT" docker compose up -d
 EOF

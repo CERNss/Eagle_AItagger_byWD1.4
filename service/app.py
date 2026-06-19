@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, status
 from loguru import logger
 
-from .runtime import TaggerRuntime
+from .runtime import InferenceBusyError, TaggerRuntime
 from .schemas import (
     BatchTagRequest,
     BatchTagResponse,
@@ -25,6 +25,8 @@ RUNTIME = TaggerRuntime(SETTINGS)
 
 
 def _http_exception_for_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, InferenceBusyError):
+        return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     if isinstance(exc, FileNotFoundError):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     if isinstance(exc, PermissionError):

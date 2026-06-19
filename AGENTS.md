@@ -62,6 +62,8 @@ HTTP client
 
 - One Uvicorn worker by default. Do not increase Uvicorn workers casually because each worker loads its own model copy into memory.
 - `TaggerRuntime` owns one ONNX Runtime `InferenceSession`.
+- Inference calls are guarded by `MAX_CONCURRENT_INFERENCE`; exhausted capacity raises `InferenceBusyError` and maps to HTTP 503 for single-image requests.
+- Startup self-check validates static model output label count against the tag CSV before accepting traffic.
 - Provider selection is CUDA-first when `CUDAExecutionProvider` is available, otherwise CPU fallback.
 - `/tag/batch` processes paths sequentially through the same runtime and returns item-level errors for invalid images.
 - Optional NVML sampling records GPU memory usage when CUDA and `pynvml` are available.
@@ -98,6 +100,10 @@ Settings are read from environment variables in `service/settings.py`.
 | `USE_CHINESE_NAME` | `true` | Use `right_tag_cn` when present |
 | `DEFAULT_TOP_K` | `50` | Default max returned tag count |
 | `BATCH_LIMIT` | `64` | Maximum `/tag/batch` size |
+| `MAX_CONCURRENT_INFERENCE` | `1` | Maximum simultaneous inference calls per process |
+| `INFERENCE_ACQUIRE_TIMEOUT_SECONDS` | `30.0` | Seconds to wait for an inference slot before returning 503 |
+| `STARTUP_SELF_CHECK` | `true` | Validate model output shape against the tag CSV at startup |
+| `REQUIRE_CUDA` | `false` | Fail startup if CUDAExecutionProvider is unavailable |
 | `REPLACE_UNDERSCORE` | `true` | Replace `_` with spaces in returned tags |
 | `UNDERSCORE_EXCLUDES` | empty | Comma-separated tags that keep underscores |
 | `ESCAPE_TAGS` | `false` | Escape backslash and parentheses |
@@ -156,6 +162,8 @@ Default Docker Compose behavior:
 - images: `${IMAGE_ROOT:-/srv/shared-images}` -> `/data/images`
 
 Inside the container, `MODEL_PATH`, `TAGS_PATH`, and `IMAGE_ROOT` are set to `/model/swinv2-v3.onnx`, `/csv/Tags-cn_2024_ver-1.0.csv`, and `/data/images`.
+
+Docker Compose sets `REQUIRE_CUDA=true` and uses a longer readiness start period so GPU deployment fails fast on missing CUDA while tolerating slow model startup.
 
 Use `init.sh` to download the model and prepare the image root. Use `build.sh` when publishing the image to the configured private registry.
 

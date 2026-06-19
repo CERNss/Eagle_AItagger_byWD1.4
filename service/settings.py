@@ -92,6 +92,10 @@ class Settings:
     default_use_chinese_name: bool
     default_top_k: int
     batch_limit: int
+    max_concurrent_inference: int
+    inference_acquire_timeout_seconds: float
+    startup_self_check: bool
+    require_cuda: bool
     replace_underscore: bool
     underscore_excludes: tuple[str, ...]
     escape_tags: bool
@@ -141,6 +145,10 @@ class Settings:
             default_use_chinese_name=_env_bool("USE_CHINESE_NAME", True),
             default_top_k=_env_int("DEFAULT_TOP_K", 50),
             batch_limit=_env_int("BATCH_LIMIT", 64),
+            max_concurrent_inference=_env_int("MAX_CONCURRENT_INFERENCE", 1),
+            inference_acquire_timeout_seconds=_env_float("INFERENCE_ACQUIRE_TIMEOUT_SECONDS", 30.0),
+            startup_self_check=_env_bool("STARTUP_SELF_CHECK", True),
+            require_cuda=_env_bool("REQUIRE_CUDA", False),
             replace_underscore=_env_bool("REPLACE_UNDERSCORE", True),
             underscore_excludes=_env_list("UNDERSCORE_EXCLUDES"),
             escape_tags=_env_bool("ESCAPE_TAGS", False),
@@ -157,6 +165,10 @@ class Settings:
             raise ValueError("DEFAULT_TOP_K must be greater than 0")
         if self.batch_limit <= 0:
             raise ValueError("BATCH_LIMIT must be greater than 0")
+        if self.max_concurrent_inference <= 0:
+            raise ValueError("MAX_CONCURRENT_INFERENCE must be greater than 0")
+        if self.inference_acquire_timeout_seconds < 0:
+            raise ValueError("INFERENCE_ACQUIRE_TIMEOUT_SECONDS must be greater than or equal to 0")
         log_format = self.observability.logging.log_format
         if log_format not in {"json", "text"}:
             raise ValueError("LOG_FORMAT must be 'json' or 'text'")

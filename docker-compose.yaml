@@ -15,23 +15,41 @@ services:
       USE_CHINESE_NAME: "true"
       DEFAULT_TOP_K: "50"
       BATCH_LIMIT: "64"
+      MAX_CONCURRENT_INFERENCE: "1"
+      INFERENCE_ACQUIRE_TIMEOUT_SECONDS: "30"
+      STARTUP_SELF_CHECK: "true"
+      REQUIRE_CUDA: "true"
       LOG_LEVEL: INFO
       LOG_FORMAT: json
       OTEL_ENABLED: "false"
       OTEL_METRICS_ENABLED: "false"
       OTEL_EXPORTER_ENDPOINT: http://otel-collector:4318
       OTEL_TRACE_SAMPLE_RATIO: "0.1"
-      NVIDIA_VISIBLE_DEVICES: "all"
     volumes:
-      - ./model:/model:ro
-      - ./csv:/csv:ro
-      - ${IMAGE_ROOT:-/srv/shared-images}:/data/images:ro
+      - type: bind
+        source: ./model
+        target: /model
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./csv
+        target: /csv
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${IMAGE_ROOT:-/srv/shared-images}
+        target: /data/images
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/readyz"]
       interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
     restart: unless-stopped
     deploy:
       resources:

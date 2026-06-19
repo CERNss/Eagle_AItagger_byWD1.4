@@ -53,6 +53,10 @@ The service is configured entirely through environment variables.
 | `USE_CHINESE_NAME` | `true` | Use `right_tag_cn` when available |
 | `DEFAULT_TOP_K` | `50` | Default max returned tag count |
 | `BATCH_LIMIT` | `64` | Maximum paths per `/tag/batch` request |
+| `MAX_CONCURRENT_INFERENCE` | `1` | Maximum simultaneous inference calls per service process |
+| `INFERENCE_ACQUIRE_TIMEOUT_SECONDS` | `30.0` | Seconds a request waits for an inference slot before returning 503 |
+| `STARTUP_SELF_CHECK` | `true` | Validate model output shape against the tag CSV during startup |
+| `REQUIRE_CUDA` | `false` | Fail startup if CUDAExecutionProvider is unavailable |
 | `REPLACE_UNDERSCORE` | `true` | Replace `_` with spaces in returned tags |
 | `UNDERSCORE_EXCLUDES` | empty | Comma-separated tags that keep underscores |
 | `ESCAPE_TAGS` | `false` | Escape `\`, `(`, `)` in returned tags |
@@ -148,6 +152,8 @@ Start the service:
 docker compose up --build
 ```
 
+The Compose template sets `REQUIRE_CUDA=true`, so GPU deployment fails startup instead of silently falling back to CPU. For CPU-only local experimentation, run `python3 main.py` directly or override the Compose environment intentionally.
+
 Before doing that, verify the host first:
 
 ```bash
@@ -221,9 +227,12 @@ Request:
 ## Operational Notes
 
 - The first version is intentionally single-process and single-session. Do not start Uvicorn with multiple workers unless you are ready for multiple model copies in memory.
+- Inference is protected by `MAX_CONCURRENT_INFERENCE`; the default serializes GPU work to keep the service stable under bursts.
+- If the inference limit is saturated longer than `INFERENCE_ACQUIRE_TIMEOUT_SECONDS`, `/tag` returns HTTP 503 so clients can retry.
+- `STARTUP_SELF_CHECK=true` fails startup when the model output label count does not match the tag CSV.
 - The service does not mutate Eagle `metadata.json` files. It only returns inference results.
 - If `IMAGE_ROOT` is set, every requested image path must resolve inside that directory.
-- If `/healthz` reports `CPUExecutionProvider`, your container GPU runtime is not wired correctly.
+- If `/healthz` reports `CPUExecutionProvider`, your container GPU runtime is not wired correctly. Set `REQUIRE_CUDA=true` when CPU fallback is unacceptable.
 
 ## Recommended Integration Pattern
 
