@@ -161,6 +161,23 @@ nvidia-smi
 docker run --rm --gpus all nvidia/cuda:12.9.0-base-ubuntu22.04 nvidia-smi
 ```
 
+## Release Image
+
+CI runs tests and configuration checks on branch pushes and pull requests. Container publishing is tag-driven: pushing a Git tag that starts with `v` builds and pushes the image to GitHub Container Registry.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The published image is tagged with the Git tag, for example:
+
+```text
+ghcr.io/cernss/eagle_aitagger_bywd1.4:v0.1.0
+```
+
+Manual publishing is also available from the GitHub Actions `CI/CD` workflow dispatch form.
+
 ## API
 
 ### `GET /healthz`
