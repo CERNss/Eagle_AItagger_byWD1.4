@@ -26,6 +26,9 @@ RUN python3 -m pip install --upgrade pip setuptools wheel \
 COPY main.py main.py
 COPY service service
 COPY scripts scripts
+COPY config.example.yaml config.example.yaml
+# Default config baked in; mount your own ./config.yaml over it to customise.
+RUN cp config.example.yaml config.yaml
 
 EXPOSE 8000
 

@@ -92,6 +92,14 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         additional_tags=(),
         exclude_tags=(),
         sort_alphabetically=False,
+        liveness_failure_threshold=5,
+        inference_hard_timeout_seconds=120.0,
+        session_auto_reload=True,
+        session_reload_cooldown_seconds=30.0,
+        startup_load_retries=0,
+        startup_load_retry_delay_seconds=0.0,
+        max_image_pixels=0,
+        timeout_keep_alive=5,
         observability=observability,
     )
     return replace(base, **overrides)

@@ -21,8 +21,10 @@ model/
 # OS
 .DS_Store
 
-# Docker
+# Docker / local config (keep the *.example templates tracked)
 *.env
+.env
+config.yaml
 
 # Logs
 *.log

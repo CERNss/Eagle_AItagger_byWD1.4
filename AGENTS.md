@@ -45,10 +45,9 @@ HTTP client
   -> TaggerRuntime.resolve_image_path()
       -> expands relative paths against IMAGE_ROOT when configured
       -> rejects paths outside IMAGE_ROOT
-  -> ImageUtils.preprocess_image()
+  -> ImageUtils.preprocess_image()  # reads an in-memory copy only; never writes the source file
       -> transparent background fill
-      -> square padding
-      -> resize to model input size
+      -> downscale oversized images to fit, then white-pad to a square (memory-bounded)
   -> ONNX Runtime InferenceSession.run()
   -> tag post-processing
       -> skip first 4 rating outputs
@@ -67,6 +66,22 @@ HTTP client
 - Provider selection is CUDA-first when `CUDAExecutionProvider` is available, otherwise CPU fallback.
 - `/tag/batch` processes paths sequentially through the same runtime and returns item-level errors for invalid images.
 - Optional NVML sampling records GPU memory usage when CUDA and `pynvml` are available.
+- Errors are classified (`service/runtime.classify_error`): input/client errors → 4xx and ignored by liveness; infra errors → retryable 503, counted toward liveness, and trigger a cooldown-gated in-process session reload.
+- `/livez` reflects dynamic health (loaded + not stuck + below the failure threshold). A watchdog thread force-exits the process if an inference exceeds `INFERENCE_HARD_TIMEOUT_SECONDS`, since native ONNX calls cannot be cancelled in-process; the orchestrator then restarts a fresh process. The fatal handler is injectable for tests.
+- Image preprocessing downscales oversized images in memory before square-padding so a single large image cannot exhaust memory; the source file is only ever read, never written.
+
+### Resilience Settings (`service/settings.py`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LIVENESS_FAILURE_THRESHOLD` | `5` | Consecutive infra failures before `/livez` returns 503 |
+| `INFERENCE_HARD_TIMEOUT_SECONDS` | `120.0` | Watchdog ceiling for a single inference (`0` disables) |
+| `SESSION_AUTO_RELOAD` | `true` | Rebuild the ONNX session in-process after a fatal inference error |
+| `SESSION_RELOAD_COOLDOWN_SECONDS` | `30.0` | Minimum gap between in-process session reloads |
+| `STARTUP_LOAD_RETRIES` | `2` | Retry transient ONNX session creation at startup |
+| `STARTUP_LOAD_RETRY_DELAY_SECONDS` | `3.0` | Delay between startup load retries |
+| `MAX_IMAGE_PIXELS` | `0` | `0` = process any size; `>0` = Pillow decode cap (decode only) |
+| `TIMEOUT_KEEP_ALIVE` | `5` | Uvicorn keep-alive seconds |
 
 ---
 
@@ -75,7 +90,8 @@ HTTP client
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/healthz` | Process health, model/tag paths, provider, observability status |
-| `GET` | `/readyz` | Returns 200 only after runtime load succeeds |
+| `GET` | `/readyz` | Returns 200 only after runtime load succeeds (one-time load gate) |
+| `GET` | `/livez` | Dynamic liveness: 503 on a dead/hung session or failure storm; drives the container healthcheck |
 | `POST` | `/tag` | Tag one image path |
 | `POST` | `/tag/batch` | Tag up to `BATCH_LIMIT` image paths |
 
@@ -85,7 +101,12 @@ The API accepts filesystem paths, not file uploads. If `IMAGE_ROOT` is set, requ
 
 ## Configuration
 
-Settings are read from environment variables in `service/settings.py`.
+Settings resolve through `service/config.py` with precedence: explicit env var
+> `config.yaml` (canonical non-secret config) > built-in default. `config.yaml`
+string values may embed `${VAR}`/`${VAR:-default}` placeholders resolved from
+the environment, and `.env` (loaded automatically, git-ignored) carries secrets.
+Both `config.yaml` and `.env` are optional; absent both, the service is pure
+env-var driven. Templates: `config.example.yaml`, `.env.example`.
 
 ### Core Settings
 
@@ -230,6 +251,7 @@ curl http://127.0.0.1:8000/readyz
 ## Notes For Future Agents
 
 - Treat `service/` as the source of truth. The old Windows batch workflow is no longer present in the active tree.
+- The service never writes source images: it opens them read-only, transforms an in-memory copy, and discards it. Keep it that way — preserving the original file byte-for-byte is a hard requirement.
 - Keep the service single-process unless explicitly changing model lifecycle and GPU memory behavior.
 - Do not add direct Eagle `metadata.json` mutation back into this service unless the API contract changes intentionally.
 - Prefer tests around settings, path safety, tag post-processing, API error mapping, and observability status when changing behavior.

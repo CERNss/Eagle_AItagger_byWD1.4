@@ -1,0 +1,62 @@
+# Eagle AI Tagger — canonical service configuration.
+#
+# Copy this file to config.yaml and edit the real values:
+#   cp config.example.yaml config.yaml
+#
+# Keys map 1:1 to the documented environment variables (UPPER_SNAKE_CASE).
+# Precedence at runtime: explicit env var > config.yaml > built-in default.
+# String values may reference secrets from .env via ${VAR} or ${VAR:-default};
+# put passwords/tokens in .env (git-ignored), not here.
+
+# --- HTTP server (used by `python main.py`) ---
+host: 0.0.0.0
+port: 8000
+timeout_keep_alive: 5            # uvicorn keep-alive seconds for idle clients
+
+# --- Model & assets ---
+model_path: model/swinv2-v3.onnx
+tags_path: csv/Tags-cn_2024_ver-1.0.csv
+image_root:                       # optional root that every image path must stay inside
+
+# --- Tagging behaviour ---
+default_threshold: 0.5
+use_chinese_name: true
+default_top_k: 50
+replace_underscore: true
+underscore_excludes:              # comma list or YAML list of tags that keep underscores
+escape_tags: false
+additional_tags:                  # always appended with score 1.0
+exclude_tags:                     # always filtered out
+sort_alphabetically: false
+
+# --- Stability / capacity ---
+batch_limit: 64
+max_concurrent_inference: 1
+inference_acquire_timeout_seconds: 30.0
+startup_self_check: true
+require_cuda: false
+
+# --- Resilience (self-healing) ---
+liveness_failure_threshold: 5          # consecutive infra failures before /livez goes 503
+inference_hard_timeout_seconds: 120.0  # watchdog: force process exit if one inference hangs longer (0 disables)
+session_auto_reload: true              # try to rebuild the ONNX session after a fatal inference error
+session_reload_cooldown_seconds: 30.0  # minimum gap between in-process session reloads
+startup_load_retries: 2                # retry transient ONNX session creation at startup
+startup_load_retry_delay_seconds: 3.0
+max_image_pixels: 0                    # 0 = process any size; >0 = PIL decompression-bomb cap (decode only, original file untouched)
+
+# --- Observability ---
+log_level: INFO
+log_format: json                  # json | text
+log_include_trace: true
+log_hash_image_paths: true
+service_name: eagle-ai-tagger
+service_version: dev
+deployment_environment: development
+otel_enabled: false
+otel_exporter_endpoint:           # e.g. http://otel-collector:4318
+otel_exporter_headers: ${OTEL_EXPORTER_HEADERS:-}   # secret auth headers come from .env
+otel_trace_sample_ratio: 0.1
+otel_metrics_enabled: false
+otel_metrics_exporter_endpoint:
+otel_metric_export_interval: 60

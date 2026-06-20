@@ -60,3 +60,10 @@ class ReadyResponse(BaseModel):
     logging_mode: str
     tracing_enabled: bool
     metrics_enabled: bool
+
+
+class LiveResponse(BaseModel):
+    status: str
+    provider: str
+    detail: str
+    consecutive_failures: int

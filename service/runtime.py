@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import math
+import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import warnings
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import pandas as pd
 from loguru import logger
 from opentelemetry import trace as otel_trace
@@ -21,7 +24,7 @@ except ImportError as exc:  # pragma: no cover - platform dependent in dev envs
 else:
     _ORT_IMPORT_ERROR = None
 
-from .image_utils import ImageUtils
+from .image_utils import ImageUtils, configure_image_limits
 from .logging import reset_image_path_context, set_image_path_context
 from .observability import metrics_recorder
 from .settings import Settings
@@ -30,9 +33,33 @@ _TRACER = otel_trace.get_tracer("eagle.ai.tagger.runtime")
 _PYNVML_AVAILABLE: bool | None = None  # None = not yet checked
 _PYNVML_MODULE: Any = None
 
+# Errors caused by the request/input itself. They are mapped to 4xx and never
+# count against runtime liveness (a bad image must not make the service look
+# unhealthy). Everything else is treated as an infrastructure failure.
+_CLIENT_ERROR_TYPES = (
+    FileNotFoundError,
+    PermissionError,
+    IsADirectoryError,
+    NotADirectoryError,
+    UnidentifiedImageError,
+    ValueError,
+)
+
 
 class InferenceBusyError(RuntimeError):
     """Raised when all inference slots stay busy past the configured timeout."""
+
+
+def classify_error(exc: Exception) -> str:
+    """Return ``"busy"``, ``"client"`` or ``"infra"`` for an inference error."""
+    if isinstance(exc, InferenceBusyError):
+        return "busy"
+    if isinstance(exc, _CLIENT_ERROR_TYPES):
+        return "client"
+    if isinstance(exc, OSError):
+        # Truncated/corrupt image reads surface as OSError; treat as input error.
+        return "client"
+    return "infra"
 
 
 class TaggerRuntime:
@@ -53,6 +80,18 @@ class TaggerRuntime:
         self._nvml_initialized = False
         self._nvml_handle = None
         self._inference_slots = threading.BoundedSemaphore(settings.max_concurrent_inference)
+        # Liveness / self-healing state
+        self._state_lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._inflight_started_at: float | None = None
+        self._reload_lock = threading.Lock()
+        self._last_reload_monotonic = 0.0
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
+        # Action taken when an inference is detected as hung. Injectable for tests.
+        self._fatal_handler: Callable[[int], Any] = os._exit
+
+    # ------------------------------------------------------------------ load
 
     def load(self) -> None:
         with _TRACER.start_as_current_span("runtime.load") as span:
@@ -66,23 +105,11 @@ class TaggerRuntime:
             if not self.settings.tags_path.exists():
                 raise FileNotFoundError(f"tags file not found: {self.settings.tags_path}")
 
-            available_providers = ort.get_available_providers()
-            providers = (
-                ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                if "CUDAExecutionProvider" in available_providers
-                else ["CPUExecutionProvider"]
-            )
+            configure_image_limits(self.settings.max_image_pixels)
 
+            available_providers = ort.get_available_providers()
             span.set_attribute("runtime.providers.available", ",".join(available_providers))
-            self.session = ort.InferenceSession(str(self.settings.model_path), providers=providers)
-            self.provider = self.session.get_providers()[0]
-            if self.settings.require_cuda and "CUDA" not in self.provider.upper():
-                raise RuntimeError(
-                    f"CUDAExecutionProvider is required but runtime selected {self.provider}"
-                )
-            self.input_name = self.session.get_inputs()[0].name
-            self.output_name = self.session.get_outputs()[0].name
-            self.target_size = self._resolve_target_size(self.session.get_inputs()[0].shape)
+            self._build_session_with_retry()
             span.set_attribute("runtime.provider", self.provider)
             logger.info(
                 "runtime.loaded",
@@ -109,7 +136,52 @@ class TaggerRuntime:
                 self._validate_model_output_shape()
 
             self.is_loaded = True
+            self._start_watchdog()
             span.set_attribute("runtime.loaded", True)
+
+    def _build_session(self) -> Any:
+        """Create (or recreate) the ONNX inference session and cache its I/O."""
+        if ort is None:
+            raise RuntimeError("onnxruntime is not installed")
+        available_providers = ort.get_available_providers()
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if "CUDAExecutionProvider" in available_providers
+            else ["CPUExecutionProvider"]
+        )
+        session = ort.InferenceSession(str(self.settings.model_path), providers=providers)
+        provider = session.get_providers()[0]
+        if self.settings.require_cuda and "CUDA" not in provider.upper():
+            raise RuntimeError(
+                f"CUDAExecutionProvider is required but runtime selected {provider}"
+            )
+        self.session = session
+        self.provider = provider
+        self.input_name = session.get_inputs()[0].name
+        self.output_name = session.get_outputs()[0].name
+        self.target_size = self._resolve_target_size(session.get_inputs()[0].shape)
+        return session
+
+    def _build_session_with_retry(self) -> None:
+        attempts = self.settings.startup_load_retries + 1
+        delay = self.settings.startup_load_retry_delay_seconds
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                self._build_session()
+                return
+            except Exception as exc:  # transient GPU/provider init failures
+                last_exc = exc
+                logger.warning(
+                    "runtime.load.attempt_failed",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    error=str(exc),
+                )
+                if attempt < attempts:
+                    time.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
     def _resolve_target_size(self, shape: list[Any]) -> int:
         for dim in shape[1:3]:
@@ -164,6 +236,8 @@ class TaggerRuntime:
             raise ValueError(f"path is not a file: {resolved}")
         return resolved
 
+    # --------------------------------------------------------------- predict
+
     def predict(
         self,
         image_path: str | Path,
@@ -171,8 +245,12 @@ class TaggerRuntime:
         use_chinese_name: bool | None = None,
         top_k: int | None = None,
     ) -> tuple[Path, list[dict[str, Any]], int]:
-        if not self.is_loaded or self.session is None:
+        session = self.session
+        if not self.is_loaded or session is None:
             raise RuntimeError("runtime is not loaded")
+        input_name = self.input_name
+        output_name = self.output_name
+        target_size = self.target_size
 
         resolved_path = self.resolve_image_path(image_path)
         image_ctx = set_image_path_context(resolved_path)
@@ -184,40 +262,46 @@ class TaggerRuntime:
                 raise InferenceBusyError(
                     "inference capacity is exhausted; retry after the current request completes"
                 )
-            with _TRACER.start_as_current_span("runtime.predict") as predict_span:
-                predict_span.set_attribute("runtime.provider", self.provider)
-                try:
-                    with _TRACER.start_as_current_span("image.preprocess"):
-                        with Image.open(resolved_path) as image:
-                            processed = ImageUtils.preprocess_image(image, self.target_size)
-                    with _TRACER.start_as_current_span("onnx.inference"):
-                        scores = self.session.run([self.output_name], {self.input_name: processed})[0][0]
-                    with _TRACER.start_as_current_span("tags.postprocess"):
-                        tags = self._postprocess_scores(
-                            scores=scores,
-                            threshold=self.settings.default_threshold if threshold is None else threshold,
-                            use_chinese_name=(
-                                self.settings.default_use_chinese_name
-                                if use_chinese_name is None
-                                else use_chinese_name
-                            ),
-                            top_k=self.settings.default_top_k if top_k is None else top_k,
+            self._mark_inflight_start()
+            try:
+                with _TRACER.start_as_current_span("runtime.predict") as predict_span:
+                    predict_span.set_attribute("runtime.provider", self.provider)
+                    try:
+                        with _TRACER.start_as_current_span("image.preprocess"):
+                            with Image.open(resolved_path) as image:
+                                processed = ImageUtils.preprocess_image(image, target_size)
+                        with _TRACER.start_as_current_span("onnx.inference"):
+                            scores = session.run([output_name], {input_name: processed})[0][0]
+                        with _TRACER.start_as_current_span("tags.postprocess"):
+                            tags = self._postprocess_scores(
+                                scores=scores,
+                                threshold=self.settings.default_threshold if threshold is None else threshold,
+                                use_chinese_name=(
+                                    self.settings.default_use_chinese_name
+                                    if use_chinese_name is None
+                                    else use_chinese_name
+                                ),
+                                top_k=self.settings.default_top_k if top_k is None else top_k,
+                            )
+                        elapsed_ms = int((time.perf_counter() - started) * 1000)
+                        predict_span.set_attribute("runtime.elapsed_ms", elapsed_ms)
+                        predict_span.set_attribute("runtime.tag_count", len(tags))
+                        self._record_gpu_metrics()
+                        self._record_success()
+                        logger.info(
+                            "runtime.predict.complete",
+                            provider=self.provider,
+                            elapsed_ms=elapsed_ms,
+                            tag_count=len(tags),
                         )
-                    elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    predict_span.set_attribute("runtime.elapsed_ms", elapsed_ms)
-                    predict_span.set_attribute("runtime.tag_count", len(tags))
-                    self._record_gpu_metrics()
-                    logger.info(
-                        "runtime.predict.complete",
-                        provider=self.provider,
-                        elapsed_ms=elapsed_ms,
-                        tag_count=len(tags),
-                    )
-                    return resolved_path, tags, elapsed_ms
-                except Exception as exc:
-                    predict_span.record_exception(exc)
-                    predict_span.set_status(Status(StatusCode.ERROR, str(exc)))
-                    raise
+                        return resolved_path, tags, elapsed_ms
+                    except Exception as exc:
+                        predict_span.record_exception(exc)
+                        predict_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        self._record_failure(exc)
+                        raise
+            finally:
+                self._mark_inflight_end()
         finally:
             if acquired:
                 self._inference_slots.release()
@@ -303,11 +387,14 @@ class TaggerRuntime:
             raise ValueError(
                 "model output does not match the number of configured tag labels"
             )
-        raw_tags = {
-            name: float(score)
-            for name, score in zip(names, content_scores)
-            if name
-        }
+        raw_tags: dict[str, float] = {}
+        for name, score in zip(names, content_scores):
+            if not name:
+                continue
+            value = float(score)
+            if not math.isfinite(value):  # drop NaN/Inf so JSON stays valid
+                continue
+            raw_tags[name] = value
 
         for tag in self.settings.additional_tags:
             raw_tags[tag] = max(raw_tags.get(tag, 0.0), 1.0)
@@ -340,6 +427,131 @@ class TaggerRuntime:
             for tag, score in normalized[:top_k]
         ]
 
+    # ----------------------------------------------------- liveness / healing
+
+    def _mark_inflight_start(self) -> None:
+        with self._state_lock:
+            self._inflight_started_at = time.monotonic()
+
+    def _mark_inflight_end(self) -> None:
+        with self._state_lock:
+            self._inflight_started_at = None
+
+    def _record_success(self) -> None:
+        with self._state_lock:
+            self._consecutive_failures = 0
+
+    def _record_failure(self, exc: Exception) -> None:
+        if classify_error(exc) != "infra":
+            return
+        with self._state_lock:
+            self._consecutive_failures += 1
+            failures = self._consecutive_failures
+        logger.warning(
+            "runtime.inference.infra_failure",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            consecutive_failures=failures,
+        )
+        if self.settings.session_auto_reload:
+            self._maybe_reload_session()
+
+    @property
+    def consecutive_failures(self) -> int:
+        with self._state_lock:
+            return self._consecutive_failures
+
+    def liveness(self) -> tuple[bool, str]:
+        """Report dynamic health: loaded, not stuck, not in a failure storm."""
+        if not self.is_loaded:
+            return False, "runtime is not loaded"
+        with self._state_lock:
+            failures = self._consecutive_failures
+            started = self._inflight_started_at
+        threshold = self.settings.liveness_failure_threshold
+        if failures >= threshold:
+            return False, f"{failures} consecutive inference failures (>= {threshold})"
+        hard = self.settings.inference_hard_timeout_seconds
+        if hard > 0 and started is not None:
+            elapsed = time.monotonic() - started
+            if elapsed >= hard:
+                return False, f"inference stuck for {elapsed:.1f}s (>= {hard:.0f}s)"
+        return True, "ok"
+
+    def _maybe_reload_session(self) -> None:
+        """Best-effort in-process session rebuild, rate-limited by a cooldown."""
+        if not self._reload_lock.acquire(blocking=False):
+            return  # another thread is already reloading
+        try:
+            now = time.monotonic()
+            if now - self._last_reload_monotonic < self.settings.session_reload_cooldown_seconds:
+                return
+            self._last_reload_monotonic = now
+            logger.warning("runtime.session.reload.start", provider=self.provider)
+            try:
+                self._build_session()
+                logger.info("runtime.session.reload.ok", provider=self.provider)
+            except Exception as exc:
+                # Reload failed: leave the failure counter climbing so liveness
+                # trips and the orchestrator restarts the container.
+                logger.error("runtime.session.reload.failed", error=str(exc))
+        finally:
+            self._reload_lock.release()
+
+    def _start_watchdog(self) -> None:
+        if self.settings.inference_hard_timeout_seconds <= 0 or self._watchdog_thread is not None:
+            return
+        self._watchdog_stop.clear()
+        thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="inference-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread = thread
+        thread.start()
+
+    def _watchdog_loop(self) -> None:
+        hard = self.settings.inference_hard_timeout_seconds
+        interval = min(5.0, hard / 4) if hard > 0 else 5.0
+        while not self._watchdog_stop.wait(interval):
+            if self._check_watchdog():
+                return
+
+    def _check_watchdog(self) -> bool:
+        """Return True (and trigger the fatal handler) if an inference is hung."""
+        hard = self.settings.inference_hard_timeout_seconds
+        if hard <= 0:
+            return False
+        with self._state_lock:
+            started = self._inflight_started_at
+        if started is None:
+            return False
+        elapsed = time.monotonic() - started
+        if elapsed < hard:
+            return False
+        logger.critical(
+            "runtime.watchdog.inference_stuck",
+            elapsed_seconds=round(elapsed, 1),
+            hard_timeout_seconds=hard,
+        )
+        # Loguru's async queue is not flushed by os._exit, so also write the
+        # reason synchronously to stderr — this is the operator's only breadcrumb.
+        try:
+            sys.stderr.write(
+                f"FATAL runtime.watchdog.inference_stuck elapsed={elapsed:.1f}s "
+                f"hard_timeout={hard:.0f}s; exiting for supervisor restart\n"
+            )
+            sys.stderr.flush()
+            logger.complete()
+        except Exception:  # pragma: no cover - never block the exit path
+            pass
+        # A native ONNX call cannot be interrupted from Python; exit the process
+        # so the supervisor (docker restart / k8s) brings up a fresh one.
+        self._fatal_handler(1)
+        return True
+
+    # ------------------------------------------------------------- gpu / nvml
+
     def _init_nvml(self) -> None:
         pynvml = self._get_pynvml_module()
         if pynvml is None or self._nvml_initialized:
@@ -371,6 +583,11 @@ class TaggerRuntime:
         metrics_recorder().record_gpu(self.provider, memory_bytes)
 
     def shutdown(self) -> None:
+        self._watchdog_stop.set()
+        thread = self._watchdog_thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            self._watchdog_thread = None
         pynvml = self._get_pynvml_module()
         if self._nvml_initialized and pynvml is not None:
             try:

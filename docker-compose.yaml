@@ -7,25 +7,24 @@ services:
     container_name: eagle-ai-tagger
     ports:
       - "8000:8000"
+    # Application tunables live in config.yaml (mounted below). Only container
+    # wiring stays here; .env supplies secrets and overrides (env wins over yaml).
+    env_file:
+      - path: .env
+        required: false
     environment:
+      CONFIG_PATH: /app/config.yaml
       MODEL_PATH: /model/swinv2-v3.onnx
       TAGS_PATH: /csv/Tags-cn_2024_ver-1.0.csv
       IMAGE_ROOT: /data/images
-      DEFAULT_THRESHOLD: "0.5"
-      USE_CHINESE_NAME: "true"
-      DEFAULT_TOP_K: "50"
-      BATCH_LIMIT: "64"
-      MAX_CONCURRENT_INFERENCE: "1"
-      INFERENCE_ACQUIRE_TIMEOUT_SECONDS: "30"
-      STARTUP_SELF_CHECK: "true"
       REQUIRE_CUDA: "true"
-      LOG_LEVEL: INFO
-      LOG_FORMAT: json
-      OTEL_ENABLED: "false"
-      OTEL_METRICS_ENABLED: "false"
-      OTEL_EXPORTER_ENDPOINT: http://otel-collector:4318
-      OTEL_TRACE_SAMPLE_RATIO: "0.1"
     volumes:
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ./model
         target: /model
@@ -45,7 +44,9 @@ services:
         bind:
           create_host_path: false
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/readyz"]
+      # /livez reflects a dead/hung GPU session, so a "running but broken"
+      # container actually fails the check and gets restarted.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/livez"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -53,6 +54,10 @@ services:
     restart: unless-stopped
     deploy:
       resources:
+        # Cap host memory so a pathological image OOM-kills only this container
+        # (then restart recovers) instead of pressuring the host. Tune to taste.
+        limits:
+          memory: 4g
         reservations:
           devices:
             - driver: nvidia

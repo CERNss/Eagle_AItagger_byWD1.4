@@ -1,36 +1,37 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from .config import config_value
+
 
 def _env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
+    value = config_value(name)
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
+    value = config_value(name)
     return default if value is None else int(value)
 
 
 def _env_float(name: str, default: float) -> float:
-    value = os.getenv(name)
+    value = config_value(name)
     return default if value is None else float(value)
 
 
 def _env_list(name: str) -> tuple[str, ...]:
-    value = os.getenv(name, "")
+    value = config_value(name) or ""
     items = [item.strip() for item in value.split(",") if item.strip()]
     return tuple(items)
 
 
 def _env_headers(name: str) -> tuple[tuple[str, str], ...]:
-    value = os.getenv(name, "")
+    value = config_value(name) or ""
     headers: list[tuple[str, str]] = []
     for raw_pair in value.split(","):
         if not raw_pair.strip():
@@ -102,16 +103,24 @@ class Settings:
     additional_tags: tuple[str, ...]
     exclude_tags: tuple[str, ...]
     sort_alphabetically: bool
+    liveness_failure_threshold: int
+    inference_hard_timeout_seconds: float
+    session_auto_reload: bool
+    session_reload_cooldown_seconds: float
+    startup_load_retries: int
+    startup_load_retry_delay_seconds: float
+    max_image_pixels: int
+    timeout_keep_alive: int
     observability: ObservabilitySettings
 
     @classmethod
     def from_env(cls) -> "Settings":
-        image_root = os.getenv("IMAGE_ROOT")
-        exporter_endpoint = os.getenv("OTEL_EXPORTER_ENDPOINT")
+        image_root = config_value("IMAGE_ROOT")
+        exporter_endpoint = config_value("OTEL_EXPORTER_ENDPOINT")
         headers = _env_headers("OTEL_EXPORTER_HEADERS")
         logging_settings = LoggingSettings(
-            level=os.getenv("LOG_LEVEL", "INFO").upper(),
-            log_format=os.getenv("LOG_FORMAT", "json").lower(),
+            level=(config_value("LOG_LEVEL") or "INFO").upper(),
+            log_format=(config_value("LOG_FORMAT") or "json").lower(),
             include_trace_context=_env_bool("LOG_INCLUDE_TRACE", True),
             hash_image_paths=_env_bool("LOG_HASH_IMAGE_PATHS", True),
         )
@@ -123,7 +132,7 @@ class Settings:
         )
         metrics_settings = MetricsSettings(
             enabled=_env_bool("OTEL_METRICS_ENABLED", False),
-            exporter_endpoint=os.getenv("OTEL_METRICS_EXPORTER_ENDPOINT", exporter_endpoint),
+            exporter_endpoint=config_value("OTEL_METRICS_EXPORTER_ENDPOINT") or exporter_endpoint,
             headers=headers,
             export_interval_seconds=_env_int("OTEL_METRIC_EXPORT_INTERVAL", 60),
         )
@@ -131,15 +140,15 @@ class Settings:
             logging=logging_settings,
             tracing=tracing_settings,
             metrics=metrics_settings,
-            service_name=os.getenv("SERVICE_NAME", "eagle-ai-tagger"),
-            service_version=os.getenv("SERVICE_VERSION", "dev"),
-            deployment_environment=os.getenv("DEPLOYMENT_ENVIRONMENT", "development"),
+            service_name=config_value("SERVICE_NAME") or "eagle-ai-tagger",
+            service_version=config_value("SERVICE_VERSION") or "dev",
+            deployment_environment=config_value("DEPLOYMENT_ENVIRONMENT") or "development",
         )
         return cls(
-            host=os.getenv("HOST", "0.0.0.0"),
+            host=config_value("HOST") or "0.0.0.0",
             port=_env_int("PORT", 8000),
-            model_path=Path(os.getenv("MODEL_PATH", "model/swinv2-v3.onnx")),
-            tags_path=Path(os.getenv("TAGS_PATH", "csv/Tags-cn_2024_ver-1.0.csv")),
+            model_path=Path(config_value("MODEL_PATH") or "model/swinv2-v3.onnx"),
+            tags_path=Path(config_value("TAGS_PATH") or "csv/Tags-cn_2024_ver-1.0.csv"),
             image_root=Path(image_root).expanduser() if image_root else None,
             default_threshold=_env_float("DEFAULT_THRESHOLD", 0.5),
             default_use_chinese_name=_env_bool("USE_CHINESE_NAME", True),
@@ -155,6 +164,14 @@ class Settings:
             additional_tags=_env_list("ADDITIONAL_TAGS"),
             exclude_tags=_env_list("EXCLUDE_TAGS"),
             sort_alphabetically=_env_bool("SORT_ALPHABETICALLY", False),
+            liveness_failure_threshold=_env_int("LIVENESS_FAILURE_THRESHOLD", 5),
+            inference_hard_timeout_seconds=_env_float("INFERENCE_HARD_TIMEOUT_SECONDS", 120.0),
+            session_auto_reload=_env_bool("SESSION_AUTO_RELOAD", True),
+            session_reload_cooldown_seconds=_env_float("SESSION_RELOAD_COOLDOWN_SECONDS", 30.0),
+            startup_load_retries=_env_int("STARTUP_LOAD_RETRIES", 2),
+            startup_load_retry_delay_seconds=_env_float("STARTUP_LOAD_RETRY_DELAY_SECONDS", 3.0),
+            max_image_pixels=_env_int("MAX_IMAGE_PIXELS", 0),
+            timeout_keep_alive=_env_int("TIMEOUT_KEEP_ALIVE", 5),
             observability=observability,
         )
 
@@ -169,6 +186,20 @@ class Settings:
             raise ValueError("MAX_CONCURRENT_INFERENCE must be greater than 0")
         if self.inference_acquire_timeout_seconds < 0:
             raise ValueError("INFERENCE_ACQUIRE_TIMEOUT_SECONDS must be greater than or equal to 0")
+        if self.liveness_failure_threshold <= 0:
+            raise ValueError("LIVENESS_FAILURE_THRESHOLD must be greater than 0")
+        if self.inference_hard_timeout_seconds < 0:
+            raise ValueError("INFERENCE_HARD_TIMEOUT_SECONDS must be greater than or equal to 0")
+        if self.session_reload_cooldown_seconds < 0:
+            raise ValueError("SESSION_RELOAD_COOLDOWN_SECONDS must be greater than or equal to 0")
+        if self.startup_load_retries < 0:
+            raise ValueError("STARTUP_LOAD_RETRIES must be greater than or equal to 0")
+        if self.startup_load_retry_delay_seconds < 0:
+            raise ValueError("STARTUP_LOAD_RETRY_DELAY_SECONDS must be greater than or equal to 0")
+        if self.max_image_pixels < 0:
+            raise ValueError("MAX_IMAGE_PIXELS must be greater than or equal to 0")
+        if self.timeout_keep_alive < 0:
+            raise ValueError("TIMEOUT_KEEP_ALIVE must be greater than or equal to 0")
         log_format = self.observability.logging.log_format
         if log_format not in {"json", "text"}:
             raise ValueError("LOG_FORMAT must be 'json' or 'text'")

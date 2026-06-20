@@ -14,4 +14,5 @@ if __name__ == "__main__":
         port=settings.port,
         workers=1,
         reload=False,
+        timeout_keep_alive=settings.timeout_keep_alive,
     )

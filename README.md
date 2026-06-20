@@ -40,7 +40,25 @@ The previous Windows batch workflow has been removed on purpose. This repository
 
 ## Configuration
 
-The service is configured entirely through environment variables.
+The service reads configuration from three layers, highest precedence first:
+
+1. **Process environment variables** (including anything in `.env`, loaded
+   automatically, and anything injected by docker-compose).
+2. **`config.yaml`** — the canonical, non-secret service configuration.
+3. **Built-in defaults** baked into `service/settings.py`.
+
+Copy the tracked templates and edit the real files (both are git-ignored):
+
+```bash
+cp config.example.yaml config.yaml   # real configuration values
+cp .env.example .env                 # secrets / machine-specific overrides
+```
+
+`config.yaml` keys are the variable names below in lowercase. String values may
+reference secrets via `${VAR}` or `${VAR:-default}`; those resolve from the
+environment, so passwords/tokens live in `.env` while `config.yaml` only names
+them. If neither file exists the service falls back to pure environment
+variables, so existing deployments keep working unchanged.
 
 | Variable | Default | Purpose |
 |---|---:|---|
@@ -63,6 +81,19 @@ The service is configured entirely through environment variables.
 | `ADDITIONAL_TAGS` | empty | Comma-separated tags always appended with score `1.0` |
 | `EXCLUDE_TAGS` | empty | Comma-separated tags always filtered out |
 | `SORT_ALPHABETICALLY` | `false` | Sort alphabetically instead of by score desc |
+
+### Resilience / Self-healing
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `LIVENESS_FAILURE_THRESHOLD` | `5` | Consecutive infrastructure failures before `/livez` reports 503 |
+| `INFERENCE_HARD_TIMEOUT_SECONDS` | `120.0` | Watchdog ceiling; if one inference hangs longer the process force-exits so the orchestrator restarts it (`0` disables) |
+| `SESSION_AUTO_RELOAD` | `true` | Try to rebuild the ONNX session in-process after a fatal inference error |
+| `SESSION_RELOAD_COOLDOWN_SECONDS` | `30.0` | Minimum gap between in-process session reloads |
+| `STARTUP_LOAD_RETRIES` | `2` | Retry transient ONNX session creation at startup |
+| `STARTUP_LOAD_RETRY_DELAY_SECONDS` | `3.0` | Delay between startup load retries |
+| `MAX_IMAGE_PIXELS` | `0` | `0` processes any size; `>0` sets Pillow's decode cap (decode only; the original file is never touched) |
+| `TIMEOUT_KEEP_ALIVE` | `5` | Uvicorn keep-alive seconds for idle clients |
 
 ### Observability
 
@@ -209,6 +240,21 @@ Example:
 curl http://127.0.0.1:8000/readyz
 ```
 
+### `GET /livez`
+
+Dynamic liveness. Returns `200` while the runtime is loaded, not in a failure
+storm, and not stuck on a hung inference; otherwise returns `503` with a reason
+and the current consecutive-failure count. Unlike `/readyz` (a one-time load
+gate), `/livez` reflects the live state of the GPU session, so a "running but
+broken" process actually fails the check. The Docker healthcheck targets this
+endpoint so `restart: unless-stopped` can recover a zombie or hung container.
+
+Example:
+
+```bash
+curl http://127.0.0.1:8000/livez
+```
+
 ### `POST /tag`
 
 Tags a single image path.
@@ -256,6 +302,9 @@ Request:
 - Inference is protected by `MAX_CONCURRENT_INFERENCE`; the default serializes GPU work to keep the service stable under bursts.
 - If the inference limit is saturated longer than `INFERENCE_ACQUIRE_TIMEOUT_SECONDS`, `/tag` returns HTTP 503 so clients can retry.
 - `STARTUP_SELF_CHECK=true` fails startup when the model output label count does not match the tag CSV.
+- **Failure handling:** input problems (missing/corrupt image, path outside `IMAGE_ROOT`) return 4xx and never affect health. Infrastructure failures (e.g. a dead GPU session) return retryable 503, increment the liveness failure counter, and trigger a best-effort in-process session reload. After `LIVENESS_FAILURE_THRESHOLD` consecutive infra failures, `/livez` reports 503 and the orchestrator restarts the container.
+- **Hang handling:** a native ONNX call cannot be interrupted from Python, so a watchdog force-exits the process when an inference exceeds `INFERENCE_HARD_TIMEOUT_SECONDS`; `restart: unless-stopped` then brings up a fresh process. Set the ceiling comfortably above your slowest real inference.
+- **Large images:** preprocessing downscales oversized images in memory before padding, so a single huge image cannot exhaust memory. Combined with the compose memory limit, a pathological image OOM-kills only the container (which then restarts). The original file on disk is only ever read, never modified.
 - The service does not mutate Eagle `metadata.json` files. It only returns inference results.
 - If `IMAGE_ROOT` is set, every requested image path must resolve inside that directory.
 - If `/healthz` reports `CPUExecutionProvider`, your container GPU runtime is not wired correctly. Set `REQUIRE_CUDA=true` when CPU fallback is unacceptable.

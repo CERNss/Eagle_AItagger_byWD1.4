@@ -6,12 +6,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, status
 from loguru import logger
+from PIL import UnidentifiedImageError
 
 from .runtime import InferenceBusyError, TaggerRuntime
 from .schemas import (
     BatchTagRequest,
     BatchTagResponse,
     HealthResponse,
+    LiveResponse,
     ReadyResponse,
     TagRequest,
     TagResponse,
@@ -25,17 +27,18 @@ RUNTIME = TaggerRuntime(SETTINGS)
 
 
 def _http_exception_for_error(exc: Exception) -> HTTPException:
+    # Capacity backpressure and infrastructure failures are retryable (503);
+    # only request/input problems map to 4xx. Infra failures additionally count
+    # toward runtime liveness inside TaggerRuntime, so a dead session self-heals.
     if isinstance(exc, InferenceBusyError):
         return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     if isinstance(exc, FileNotFoundError):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     if isinstance(exc, PermissionError):
         return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
-    if isinstance(exc, OSError):
+    if isinstance(exc, (UnidentifiedImageError, OSError, ValueError)):
         return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    if isinstance(exc, ValueError):
-        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
 
 
 @asynccontextmanager
@@ -96,7 +99,7 @@ def _observability_payload() -> dict[str, bool | str | None]:
 
 
 @app.get("/healthz", response_model=HealthResponse)
-def healthz() -> HealthResponse:
+async def healthz() -> HealthResponse:
     payload = _observability_payload()
     return HealthResponse(
         status="ok",
@@ -109,7 +112,7 @@ def healthz() -> HealthResponse:
 
 
 @app.get("/readyz", response_model=ReadyResponse)
-def readyz() -> ReadyResponse:
+async def readyz() -> ReadyResponse:
     if not RUNTIME.is_loaded:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -117,6 +120,25 @@ def readyz() -> ReadyResponse:
         )
     payload = _observability_payload()
     return ReadyResponse(status="ready", provider=RUNTIME.provider, **payload)
+
+
+@app.get("/livez", response_model=LiveResponse)
+async def livez() -> LiveResponse:
+    # Dynamic liveness: reflects a dead/hung GPU session and failure storms so an
+    # orchestrator healthcheck can actually restart a "running but broken" process.
+    healthy, detail = RUNTIME.liveness()
+    response = LiveResponse(
+        status="live" if healthy else "unhealthy",
+        provider=RUNTIME.provider,
+        detail=detail,
+        consecutive_failures=RUNTIME.consecutive_failures,
+    )
+    if not healthy:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=response.model_dump(),
+        )
+    return response
 
 
 @app.post("/tag", response_model=TagResponse)

@@ -171,6 +171,17 @@ sync_image() {
 }
 
 mkdir -p "${ROOT_DIR}/model" "${ROOT_DIR}/csv"
+
+# Scaffold local config from tracked templates (real files are git-ignored).
+if [[ ! -f "${ROOT_DIR}/config.yaml" && -f "${ROOT_DIR}/config.example.yaml" ]]; then
+  cp "${ROOT_DIR}/config.example.yaml" "${ROOT_DIR}/config.yaml"
+  echo "Created config.yaml from config.example.yaml"
+fi
+if [[ ! -f "${ROOT_DIR}/.env" && -f "${ROOT_DIR}/.env.example" ]]; then
+  cp "${ROOT_DIR}/.env.example" "${ROOT_DIR}/.env"
+  echo "Created .env from .env.example"
+fi
+
 download_file "$MODEL_URL" "$MODEL_PATH"
 
 if [[ "$DOWNLOAD_TAGS" == "1" ]]; then

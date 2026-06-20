@@ -19,3 +19,5 @@ model
 csv/存档的字典
 run.log
 图像标注处理报告.txt
+.env
+config.yaml
