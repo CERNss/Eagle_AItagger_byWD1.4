@@ -163,7 +163,14 @@ docker run --rm --gpus all nvidia/cuda:12.9.0-base-ubuntu22.04 nvidia-smi
 
 ## Release Image
 
-CI runs tests and configuration checks on branch pushes and pull requests. Container publishing is tag-driven and gated to `develop`: pushing a Git tag that starts with `v` builds and pushes the image only when the tagged commit is contained in `origin/develop`.
+CI runs tests and configuration checks on branch pushes and pull requests. Container publishing is tag-driven and gated to `develop`: pushing a Git tag that starts with `v` builds and pushes the image to Docker Hub only when the tagged commit is contained in `origin/develop`.
+
+GitHub Actions requires these repository secrets:
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+
+By default, CI publishes `cernss/eagle-ai-tagger`. Set the repository variable `DOCKERHUB_REPOSITORY` to publish a different Docker Hub repository.
 
 ```bash
 git switch develop
@@ -175,7 +182,7 @@ git push origin v0.1.0
 The published image is tagged with the Git tag, for example:
 
 ```text
-ghcr.io/cernss/eagle_aitagger_bywd1.4:v0.1.0
+cernss/eagle-ai-tagger:v0.1.0
 ```
 
 Manual publishing is also available from the GitHub Actions `CI/CD` workflow dispatch form, but it must be run from the `develop` branch.
