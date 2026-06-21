@@ -95,7 +95,11 @@ class TaggerRuntime:
         self._inflight: dict[int, float] = {}
         self._inflight_seq = 0
         self._reload_lock = threading.Lock()
-        self._last_reload_monotonic = 0.0
+        # None = never reloaded. Do NOT use 0.0 as a sentinel: the cooldown check
+        # compares against time.monotonic(), whose epoch is system boot, so on a
+        # freshly-booted host (e.g. a CI runner) monotonic() can be < cooldown and
+        # 0.0 would wrongly gate the very first reload.
+        self._last_reload_monotonic: float | None = None
         self._watchdog_thread: threading.Thread | None = None
         self._watchdog_stop = threading.Event()
         # Action taken when an inference is detected as hung. Injectable for tests.
@@ -503,7 +507,10 @@ class TaggerRuntime:
             return  # another thread is already reloading
         try:
             now = time.monotonic()
-            if now - self._last_reload_monotonic < self.settings.session_reload_cooldown_seconds:
+            if (
+                self._last_reload_monotonic is not None
+                and now - self._last_reload_monotonic < self.settings.session_reload_cooldown_seconds
+            ):
                 return
             self._last_reload_monotonic = now
             logger.warning("runtime.session.reload.start", provider=self.provider)

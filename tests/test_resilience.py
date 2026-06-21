@@ -141,6 +141,25 @@ def test_session_reload_respects_cooldown(monkeypatch):
     assert len(reloads) == 1  # second failure within cooldown does not reload
 
 
+def test_first_reload_not_gated_by_low_monotonic_clock(monkeypatch):
+    # Regression: monotonic()'s epoch is system boot, so on a freshly-booted host
+    # (e.g. a CI runner) it can be < cooldown. The first reload must still fire;
+    # the old 0.0 sentinel gated it and flaked CI non-deterministically.
+    import service.runtime as runtime_mod
+
+    runtime = _runtime(
+        monkeypatch,
+        SESSION_AUTO_RELOAD="true",
+        SESSION_RELOAD_COOLDOWN_SECONDS="100",
+    )
+    runtime.is_loaded = True
+    reloads: list[bool] = []
+    monkeypatch.setattr(runtime, "_build_session", lambda: reloads.append(True))
+    monkeypatch.setattr(runtime_mod.time, "monotonic", lambda: 5.0)  # < cooldown
+    runtime._record_failure(RuntimeError("x"))
+    assert reloads == [True]
+
+
 def test_postprocess_drops_non_finite_scores(monkeypatch):
     runtime = _runtime(monkeypatch)
     runtime.english_names = ["a", "b", "c"]
