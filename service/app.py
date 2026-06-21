@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, status
 from loguru import logger
-from PIL import UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 
 from .runtime import InferenceBusyError, TaggerRuntime
 from .schemas import (
@@ -36,7 +36,7 @@ def _http_exception_for_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     if isinstance(exc, PermissionError):
         return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
-    if isinstance(exc, (UnidentifiedImageError, OSError, ValueError)):
+    if isinstance(exc, (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError)):
         return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
 
@@ -190,9 +190,19 @@ def tag_batch(request: BatchTagRequest) -> BatchTagResponse:
         raise _http_exception_for_error(exc) from exc
 
     total_elapsed = int((time.perf_counter() - started) * 1000)
+    # The HTTP call itself returns 200 with per-item results, but recording every
+    # batch as "success" hides batches where some/all images failed. Reflect the
+    # actual outcome so dashboards and alerts are not blind to a degraded run.
+    failure_count = sum(1 for item in results if item.get("success") is False)
+    if failure_count == 0:
+        batch_status = "success"
+    elif failure_count == len(results):
+        batch_status = "error"
+    else:
+        batch_status = "partial"
     metrics_recorder().record_request(
         "/tag/batch",
-        "success",
+        batch_status,
         RUNTIME.provider,
         total_elapsed,
         batch_size=len(request.image_paths),

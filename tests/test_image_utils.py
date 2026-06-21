@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from service.image_utils import ImageUtils, configure_image_limits
@@ -44,6 +45,35 @@ def test_preprocess_handles_rgba_transparency():
     img = Image.new("RGBA", (32, 32), (255, 0, 0, 0))  # fully transparent
     out = ImageUtils.preprocess_image(img, 32)
     assert out.shape == (1, 32, 32, 3)
+
+
+def test_fill_transparent_opaque_returns_pixels_unchanged():
+    # Opaque image takes the fast path; compositing onto white is a no-op, so the
+    # pixels must be bit-for-bit identical to the input.
+    img = Image.new("RGB", (8, 8), (10, 20, 30))
+    out = ImageUtils.fill_transparent(img)
+    assert out.mode == "RGB"
+    assert (np.array(out) == [10, 20, 30]).all()
+
+
+def test_fill_transparent_composites_alpha_onto_white():
+    img = Image.new("RGBA", (4, 4), (255, 0, 0, 0))  # fully transparent red
+    out = ImageUtils.fill_transparent(img)
+    assert out.mode == "RGB"
+    assert (np.array(out) == 255).all()  # transparent pixels become white
+
+
+def test_preprocess_rejects_decompression_bomb(tmp_path):
+    path = tmp_path / "big.png"
+    Image.new("RGB", (50, 50), (0, 0, 0)).save(path)
+    original = Image.MAX_IMAGE_PIXELS
+    configure_image_limits(16)  # 16px cap; 50x50=2500 >> 2*16 trips the guard
+    try:
+        with pytest.raises(Image.DecompressionBombError):
+            with Image.open(path) as img:
+                ImageUtils.preprocess_image(img, 8)
+    finally:
+        Image.MAX_IMAGE_PIXELS = original
 
 
 def test_configure_image_limits_toggle():

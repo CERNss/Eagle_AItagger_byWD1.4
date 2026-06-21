@@ -80,7 +80,7 @@ HTTP client
 | `SESSION_RELOAD_COOLDOWN_SECONDS` | `30.0` | Minimum gap between in-process session reloads |
 | `STARTUP_LOAD_RETRIES` | `2` | Retry transient ONNX session creation at startup |
 | `STARTUP_LOAD_RETRY_DELAY_SECONDS` | `3.0` | Delay between startup load retries |
-| `MAX_IMAGE_PIXELS` | `0` | `0` = process any size; `>0` = Pillow decode cap (decode only) |
+| `MAX_IMAGE_PIXELS` | `89478485` | Pillow decode cap (~89.5 MP); oversized image → 400, not OOM. `0` disables the cap (decode only) |
 | `TIMEOUT_KEEP_ALIVE` | `5` | Uvicorn keep-alive seconds |
 
 ---

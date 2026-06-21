@@ -26,6 +26,15 @@ class ImageUtils:
 
     @staticmethod
     def fill_transparent(image: Image.Image, color: str = "WHITE") -> Image.Image:
+        has_alpha = image.mode in ("RGBA", "LA", "PA") or (
+            image.mode == "P" and "transparency" in image.info
+        )
+        if not has_alpha:
+            # Opaque image: there is nothing to composite, so skip the RGBA
+            # round-trip (extra canvas + paste) and decode straight to RGB. This
+            # halves peak buffers for the common JPEG/RGB case and is bit-for-bit
+            # identical to compositing a fully-opaque image onto white.
+            return image.convert("RGB")
         image = image.convert("RGBA")
         new_image = Image.new("RGBA", image.size, color)
         new_image.paste(image, mask=image)

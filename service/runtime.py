@@ -42,6 +42,11 @@ _CLIENT_ERROR_TYPES = (
     IsADirectoryError,
     NotADirectoryError,
     UnidentifiedImageError,
+    # A decompression bomb is a property of the input image, not the runtime, so
+    # it must map to 4xx and never count against liveness. It subclasses plain
+    # Exception (not OSError), so it has to be listed explicitly or it would be
+    # misclassified as an infra failure and trigger a needless session reload.
+    Image.DecompressionBombError,
     ValueError,
 )
 
@@ -83,7 +88,12 @@ class TaggerRuntime:
         # Liveness / self-healing state
         self._state_lock = threading.Lock()
         self._consecutive_failures = 0
-        self._inflight_started_at: float | None = None
+        # Start time of every in-flight inference, keyed by a monotonic token.
+        # A single shared timestamp would be wrong under MAX_CONCURRENT_INFERENCE
+        # > 1: a fast call finishing would clear a slow call's clock and hide a
+        # hang. The watchdog/liveness judge by the oldest entry instead.
+        self._inflight: dict[int, float] = {}
+        self._inflight_seq = 0
         self._reload_lock = threading.Lock()
         self._last_reload_monotonic = 0.0
         self._watchdog_thread: threading.Thread | None = None
@@ -262,7 +272,7 @@ class TaggerRuntime:
                 raise InferenceBusyError(
                     "inference capacity is exhausted; retry after the current request completes"
                 )
-            self._mark_inflight_start()
+            inflight_token = self._mark_inflight_start()
             try:
                 with _TRACER.start_as_current_span("runtime.predict") as predict_span:
                     predict_span.set_attribute("runtime.provider", self.provider)
@@ -301,7 +311,7 @@ class TaggerRuntime:
                         self._record_failure(exc)
                         raise
             finally:
-                self._mark_inflight_end()
+                self._mark_inflight_end(inflight_token)
         finally:
             if acquired:
                 self._inference_slots.release()
@@ -429,13 +439,22 @@ class TaggerRuntime:
 
     # ----------------------------------------------------- liveness / healing
 
-    def _mark_inflight_start(self) -> None:
+    def _mark_inflight_start(self) -> int:
         with self._state_lock:
-            self._inflight_started_at = time.monotonic()
+            self._inflight_seq += 1
+            token = self._inflight_seq
+            self._inflight[token] = time.monotonic()
+            return token
 
-    def _mark_inflight_end(self) -> None:
+    def _mark_inflight_end(self, token: int) -> None:
         with self._state_lock:
-            self._inflight_started_at = None
+            self._inflight.pop(token, None)
+
+    def _oldest_inflight_start(self) -> float | None:
+        # Caller must hold ``_state_lock``.
+        if not self._inflight:
+            return None
+        return min(self._inflight.values())
 
     def _record_success(self) -> None:
         with self._state_lock:
@@ -467,7 +486,7 @@ class TaggerRuntime:
             return False, "runtime is not loaded"
         with self._state_lock:
             failures = self._consecutive_failures
-            started = self._inflight_started_at
+            started = self._oldest_inflight_start()
         threshold = self.settings.liveness_failure_threshold
         if failures >= threshold:
             return False, f"{failures} consecutive inference failures (>= {threshold})"
@@ -523,7 +542,7 @@ class TaggerRuntime:
         if hard <= 0:
             return False
         with self._state_lock:
-            started = self._inflight_started_at
+            started = self._oldest_inflight_start()
         if started is None:
             return False
         elapsed = time.monotonic() - started

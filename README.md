@@ -92,7 +92,7 @@ variables, so existing deployments keep working unchanged.
 | `SESSION_RELOAD_COOLDOWN_SECONDS` | `30.0` | Minimum gap between in-process session reloads |
 | `STARTUP_LOAD_RETRIES` | `2` | Retry transient ONNX session creation at startup |
 | `STARTUP_LOAD_RETRY_DELAY_SECONDS` | `3.0` | Delay between startup load retries |
-| `MAX_IMAGE_PIXELS` | `0` | `0` processes any size; `>0` sets Pillow's decode cap (decode only; the original file is never touched) |
+| `MAX_IMAGE_PIXELS` | `89478485` | Pillow's decode cap (~89.5 MP); an oversized image is refused with a 400 instead of risking an OOM. `0` disables the cap to process any size. Decode only — the original file is never touched |
 | `TIMEOUT_KEEP_ALIVE` | `5` | Uvicorn keep-alive seconds for idle clients |
 
 ### Observability

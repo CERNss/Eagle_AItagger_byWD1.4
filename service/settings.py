@@ -6,6 +6,11 @@ from pathlib import Path
 
 from .config import config_value
 
+# Pillow's historical decompression-bomb guard (~89.5 MP). We default to it
+# instead of disabling the cap so a pathological image is refused with a 4xx
+# rather than driving the worker into an OOM. Set MAX_IMAGE_PIXELS=0 to opt out.
+DEFAULT_MAX_IMAGE_PIXELS = 89_478_485
+
 
 def _env_bool(name: str, default: bool) -> bool:
     value = config_value(name)
@@ -170,7 +175,7 @@ class Settings:
             session_reload_cooldown_seconds=_env_float("SESSION_RELOAD_COOLDOWN_SECONDS", 30.0),
             startup_load_retries=_env_int("STARTUP_LOAD_RETRIES", 2),
             startup_load_retry_delay_seconds=_env_float("STARTUP_LOAD_RETRY_DELAY_SECONDS", 3.0),
-            max_image_pixels=_env_int("MAX_IMAGE_PIXELS", 0),
+            max_image_pixels=_env_int("MAX_IMAGE_PIXELS", DEFAULT_MAX_IMAGE_PIXELS),
             timeout_keep_alive=_env_int("TIMEOUT_KEEP_ALIVE", 5),
             observability=observability,
         )
