@@ -3,13 +3,11 @@ name: CI/CD
 on:
   push:
     branches:
-      - develop
       - main
     tags:
       - "v*"
   pull_request:
     branches:
-      - develop
       - main
   workflow_dispatch:
     inputs:
@@ -87,19 +85,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Enforce develop release source
+      - name: Enforce main release source
         run: |
-          git fetch origin develop --prune
+          git fetch origin main --prune
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            if [[ "${GITHUB_REF}" != "refs/heads/develop" ]]; then
-              echo "Manual package publishing must be run from the develop branch." >&2
+            if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+              echo "Manual package publishing must be run from the main branch." >&2
               exit 1
             fi
             exit 0
           fi
 
-          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/develop; then
-            echo "Package tags must point to a commit contained in origin/develop." >&2
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Package tags must point to a commit contained in origin/main." >&2
             exit 1
           fi
 
