@@ -43,7 +43,7 @@ session_auto_reload: true              # try to rebuild the ONNX session after a
 session_reload_cooldown_seconds: 30.0  # minimum gap between in-process session reloads
 startup_load_retries: 2                # retry transient ONNX session creation at startup
 startup_load_retry_delay_seconds: 3.0
-max_image_pixels: 0                    # 0 = process any size; >0 = PIL decompression-bomb cap (decode only, original file untouched)
+max_image_pixels: 89478485             # PIL decompression-bomb cap (~89.5 MP); decode only, original file untouched. 0 = process any size
 
 # --- Observability ---
 log_level: INFO
